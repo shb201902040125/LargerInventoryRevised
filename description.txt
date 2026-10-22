@@ -1,1 +1,2 @@
-Modify this file with a description of your mod.
+LargerInventory Revised — 超大物品储存模组（重构版，WIP）。
+玩家/世界作用域持久化、页缓存、异步接入、并行指令、联机请求/结果。

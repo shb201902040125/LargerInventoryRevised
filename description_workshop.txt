@@ -1,1 +1,6 @@
-This description will show up on the steam page, check out https://steamcommunity.com/comment/Guide/formattinghelp.
+LargerInventory Revised — 超大物品储存模组（重构版，WIP）。
+
+当前版本提供玩家/世界作用域的 .LI 持久化、页缓存与快速视图、异步拾取/消耗接入、
+强指定指令并行，以及联机请求/结果协议。
+
+注意：本版本仍在验证阶段；Debug 构建包含测试命令，Release 构建不向玩家开放指令。
