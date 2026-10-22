@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<!-- Import tModLoader mod properties -->
+	<Import Project="..\tModLoader.targets" />
+
+	<!-- General -->
+	<PropertyGroup>
+	  <AssemblyName>LargerInventory</AssemblyName>
+	  <RootNamespace>LargerInventory</RootNamespace>
+	</PropertyGroup>
+
+	<!-- 旧实现存档：只保留源码供参考，不参与编译 -->
+	<ItemGroup>
+	  <Compile Remove="Backend\Legacy\**\*.cs" />
+	  <EmbeddedResource Remove="Backend\Legacy\**" />
+	  <AdditionalFiles Remove="Backend\Legacy\**" />
+	  <None Remove="Backend\Legacy\**" />
+	</ItemGroup>
+
+	<!-- References -->
+
+</Project>

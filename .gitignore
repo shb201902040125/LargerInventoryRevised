@@ -1,0 +1,21 @@
+# Build output
+bin/
+obj/
+
+# IDE / user-specific files
+.vs/
+.idea/
+*.user
+*.suo
+*.userprefs
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local tooling / harness
+.dsh-project-memory/
+.dsh-office-*/
+
+# Built mod package
+*.tmod
