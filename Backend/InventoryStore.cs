@@ -92,8 +92,6 @@ public sealed class InventoryStore : IDisposable
             _journal = new StoreRedoJournal(storeDirectory);
             _journal.Recover();
             _ledger = StoreRedoJournal.ReadOptional(Path.Combine(storeDirectory, StoreRedoJournal.LedgerName));
-            // 只有具备持久化能力时才允许真正卸载页。
-            Config.EnablePageEviction = true;
         }
         else
         {

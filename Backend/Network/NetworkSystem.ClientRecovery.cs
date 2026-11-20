@@ -42,9 +42,10 @@ public static partial class NetworkSystem
 
     private static void PumpClientRecovery(long now)
     {
-        if (_clientJournal is null || now < _nextRecovery || Requests.Count >= MaxPending)
+        var config = RuntimeConfig;
+        if (_clientJournal is null || now < _nextRecovery || Requests.Count >= config.MaxPendingNetworkRequests)
             return;
-        _nextRecovery = now + 2_000;
+        _nextRecovery = now + config.NetworkRecoveryRetryMs;
         foreach (var entry in _clientJournal.GetPending())
         {
             if (Requests.Values.Any(pending => pending.Request == entry.OperationId))

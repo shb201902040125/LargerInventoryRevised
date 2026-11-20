@@ -301,7 +301,7 @@ internal static class PlayerItemDelivery
             return;
         }
 
-        state.NextRetry = Main.GameUpdateCount + 60;
+        state.NextRetry = Main.GameUpdateCount + (ulong)StoreConfig.Runtime.SinglePlayerDeliveryRetryTicks;
         var overflow = new List<Item>();
         Give(player, state.Items, overflow);
         DropOverflow(player, overflow);

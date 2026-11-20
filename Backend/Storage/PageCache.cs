@@ -192,6 +192,7 @@ internal sealed class PageCache
 
         var now = NowMs();
         var loaded = _directory.Allocated.Where(p => p.Loaded).ToList();
+        var remainingLoaded = loaded.Count;
 
         foreach (var page in loaded)
         {
@@ -201,7 +202,7 @@ internal sealed class PageCache
             }
 
             var idle = now - page.LastUsedMs;
-            var overLimit = loaded.Count(p => p.Loaded) > _config.MaxLoadedPages;
+            var overLimit = remainingLoaded > _config.MaxLoadedPages;
             if (!overLimit && idle < _config.PageIdleUnloadMs)
             {
                 continue;
@@ -211,6 +212,7 @@ internal sealed class PageCache
                 continue;
 
             page.ReleaseSlots();
+            remainingLoaded--;
         }
     }
 

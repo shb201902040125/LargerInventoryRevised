@@ -47,7 +47,7 @@ public static partial class NetworkSystem
         try
         {
             reserved = create();
-            if (!ValidateCommand(reserved) || reserved.Kind is not (CommandKind.Put or CommandKind.Move or CommandKind.Take))
+            if (!ValidateCommand(reserved, store.Config) || reserved.Kind is not (CommandKind.Put or CommandKind.Move or CommandKind.Take))
             {
                 completed(null, reserved is null ? CommandResult.Fail(CommandStatus.InvalidArg) :
                     Command.FailUnexecuted(reserved, CommandStatus.InvalidArg));

@@ -15,8 +15,6 @@ namespace LargerInventory.Backend.Commands;
 /// </summary>
 internal sealed partial class CommandExecutor
 {
-    private const int MaxDrainBatches = 1024;
-
     private readonly InventoryStore _store;
     private readonly CommandQueue _queue;
     private readonly object _executeGate = new();
@@ -110,7 +108,7 @@ internal sealed partial class CommandExecutor
         {
             _executingThreadId = Environment.CurrentManagedThreadId;
 
-            var budget = MaxDrainBatches;
+            var budget = _store.Config.MaxDrainBatches;
             while (budget-- > 0 && _queue.Count > 0)
             {
                 if (!_queue.TryTakeBatch(long.MaxValue, _store.Config.MaxBatchCommands, out var batch))
@@ -231,9 +229,12 @@ internal sealed partial class CommandExecutor
                         continue;
                     }
 
+                    if (touchedPages.Count != 0 && !command.Access.IsStrong && command.Kind != CommandKind.NopBoundary)
+                    {
+                        _store.SyncSummaries(touchedPages);
+                        touchedPages.Clear();
+                    }
                     ExecuteCommandSafe(command, touchedPages, pinnedPages);
-                    _store.SyncSummaries(touchedPages);
-                    touchedPages.Clear();
                 }
                 finally
                 {

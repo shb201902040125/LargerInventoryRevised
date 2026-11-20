@@ -15,8 +15,11 @@ internal static partial class Program
     private static int _passed;
     private static int _failed;
 
-    private static int Main()
+    private static int Main(string[] args)
     {
+        if (args.Contains("--benchmark-waves", StringComparer.Ordinal))
+            return RunWavesBenchmark();
+
         Run(nameof(PageDirectory_AllocatesAfterRestoredPages));
         Run(nameof(PageDirectory_ReusesGapsWithoutTouchingExistingPages));
         Run(nameof(PageStore_ListsBackupOnlyPages));
@@ -49,6 +52,7 @@ internal static partial class Program
         RunQueueP0Tests();
         RunBatchPageTests();
         RunBatchConcurrencyTests();
+        RunBatchSummaryTests();
         Console.WriteLine($"Passed: {_passed}, Failed: {_failed}");
         return _failed == 0 ? 0 : 1;
     }

@@ -21,14 +21,10 @@ public static partial class NetworkSystem
     internal const byte CompletedOperationFlag = 16;
     internal const int MaxResultBytes = 4 * 1024 * 1024;
     private const int FrameBytes = 24 * 1024; // Below Terraria's ushort packet length limit.
-    private const int MaxRemoteSlots = 1024;
-    private const int MaxTakeItems = 4096;
-    private const int MaxPending = 16;
-    private const int MaxInbound = 512;
-    private const int MaxInboundPerSlot = 16;
-    private const int MaxTransfers = 32;
+    internal const int MaxWireSlots = 1024; // Maximum slot count accepted by this wire version.
     private const int EnteredConnectionState = 10;
-    private const long RequestTimeoutMs = 60_000;
+
+    private static StoreConfig RuntimeConfig => StoreConfig.Runtime;
 
     internal enum Op : byte { Hello = 1, Welcome, Read, Mutate, Put, DebugFill, Lookup, Receipt, Result, Trusted = 12, Retire, RejectGrant }
     private enum Scope : byte { Player, World }
@@ -189,7 +185,7 @@ public static partial class NetworkSystem
         // Freeze the small scalar request before a handshake or retry can defer sending it.
         using var bytes = new MemoryStream();
         using var writer = new BinaryWriter(bytes);
-        if (!WriteCommand(writer, command))
+        if (!WriteCommand(writer, command, RuntimeConfig))
         {
             Invoke(callback ?? command.Callback, CommandResult.Fail(CommandStatus.InvalidArg));
             return requestId;
@@ -219,7 +215,7 @@ public static partial class NetworkSystem
             request = recoverable ? NewRecoverableId() : Guid.NewGuid();
         }
 
-        if (Requests.Count >= MaxPending)
+        if (Requests.Count >= RuntimeConfig.MaxPendingNetworkRequests)
         {
             Invoke(callback, CommandResult.Fail(CommandStatus.Throttled));
             return request;
@@ -408,8 +404,9 @@ public static partial class NetworkSystem
         {
             SlotRevisions.TryGetValue(slot, out var current);
             QueuedBySlot.TryGetValue(slot, out var queued);
-            var slotLimit = slot < 0 ? MaxInbound : MaxInboundPerSlot;
-            if (_epoch != epoch || revision != current || Incoming.Count >= MaxInbound || queued >= slotLimit)
+            var config = RuntimeConfig;
+            var slotLimit = slot < 0 ? config.MaxInboundNetworkMessages : config.MaxInboundNetworkMessagesPerConnection;
+            if (_epoch != epoch || revision != current || Incoming.Count >= config.MaxInboundNetworkMessages || queued >= slotLimit)
             {
                 return;
             }
@@ -483,7 +480,7 @@ public static partial class NetworkSystem
         ArgumentNullException.ThrowIfNull(reserve);
         ArgumentNullException.ThrowIfNull(settle);
         if (request == Guid.Empty || !Sessions.TryGetValue(slot, out var session) || !IsCurrent(session) ||
-            session.Sources.Count >= MaxPending)
+            session.Sources.Count >= RuntimeConfig.MaxPendingNetworkRequests)
         {
             return false;
         }
@@ -551,7 +548,7 @@ public static partial class NetworkSystem
             return;
         }
 
-        if (Outgoing.Count >= MaxTransfers)
+        if (Outgoing.Count >= RuntimeConfig.MaxNetworkTransfers)
         {
             // Caller retains its operation ID and can ask again. Never mutate without reply capacity.
             return;
@@ -567,7 +564,7 @@ public static partial class NetworkSystem
 
         if (op == Op.Read)
         {
-            if (!ValidateCommand(command))
+            if (!ValidateCommand(command, store.Config))
             {
                 Reply(CommandResult.Fail(CommandStatus.InvalidArg));
                 return;
@@ -676,7 +673,7 @@ public static partial class NetworkSystem
                 create = source.Reserve;
                 break;
             case Op.DebugFill when scope == Scope.World && ModContent.GetInstance<LargerInventoryConfig>().EnableTestCommands:
-                create = () => BuildDebugFill(type, count);
+                create = () => BuildDebugFill(type, count, store.Config);
                 break;
             default:
                 Reply(CommandResult.Fail(CommandStatus.InvalidArg));
@@ -710,7 +707,7 @@ public static partial class NetworkSystem
     }
 
     private static TransactionLedger GetLedger(InventoryStore store) =>
-        _ledgers.GetValue(store, value => new TransactionLedger(value.LoadTransactionLedger()));
+        _ledgers.GetValue(store, value => new TransactionLedger(value.LoadTransactionLedger(), value.Config));
 
     private static TransactionLedger.Entry Execute(Session session, InventoryStore store, Guid request,
         byte[] fingerprint, Func<Command> create, out CommandResult failure)
@@ -748,7 +745,7 @@ public static partial class NetworkSystem
         try
         {
             reserved = create();
-            if (!ValidateCommand(reserved) || reserved.Kind is not (CommandKind.Put or CommandKind.Move))
+            if (!ValidateCommand(reserved, store.Config) || reserved.Kind is not (CommandKind.Put or CommandKind.Move))
             {
                 failure = reserved is null ? CommandResult.Fail(CommandStatus.InvalidArg) :
                     Command.FailUnexecuted(reserved, CommandStatus.InvalidArg);
@@ -810,7 +807,7 @@ public static partial class NetworkSystem
 
     private static void QueueResult(Session session, Scope scope, Guid correlation, Guid request, byte flags, byte[] bytes)
     {
-        if (Outgoing.Count < MaxTransfers)
+        if (Outgoing.Count < RuntimeConfig.MaxNetworkTransfers)
         {
             Outgoing.Enqueue(new Transfer
             {
@@ -821,7 +818,8 @@ public static partial class NetworkSystem
 
     private static void PumpTransfers()
     {
-        for (var i = 0; i < 8 && Outgoing.TryDequeue(out var transfer); i++)
+        var budget = RuntimeConfig.MaxNetworkFramesPerUpdate;
+        for (var i = 0; i < budget && Outgoing.TryDequeue(out var transfer); i++)
         {
             if (!IsCurrent(transfer.Session))
             {
@@ -934,7 +932,9 @@ public static partial class NetworkSystem
 
     public static void Update()
     {
-        for (var i = 0; i < (Main.netMode == NetmodeID.Server ? 16 : MaxInbound); i++)
+        var config = RuntimeConfig;
+        var budget = Main.netMode == NetmodeID.Server ? config.MaxServerInboundMessagesPerUpdate : config.MaxInboundNetworkMessages;
+        for (var i = 0; i < budget; i++)
         {
             Inbound inbound;
             lock (InboundGate)
@@ -984,7 +984,7 @@ public static partial class NetworkSystem
 
         var now = Environment.TickCount64;
         PumpClientRecovery(now);
-        if (_client is null && _clientPlayer != Guid.Empty && now - _helloSent >= 2_000)
+        if (_client is null && _clientPlayer != Guid.Empty && now - _helloSent >= config.NetworkHelloRetryMs)
         {
             WriteHello();
         }
@@ -992,7 +992,7 @@ public static partial class NetworkSystem
         var expired = new List<Guid>();
         foreach (var pair in Requests)
         {
-            if (now - pair.Value.Started >= RequestTimeoutMs)
+            if (now - pair.Value.Started >= config.NetworkRequestTimeoutMs)
             {
                 expired.Add(pair.Key);
             }
@@ -1150,7 +1150,7 @@ public static partial class NetworkSystem
         return (int)Math.Min(count, int.MaxValue);
     }
 
-    private static Command BuildDebugFill(int type, int count)
+    private static Command BuildDebugFill(int type, int count, StoreConfig config)
     {
         if (!ValidType(type) || count <= 0)
         {
@@ -1159,7 +1159,7 @@ public static partial class NetworkSystem
 
         var item = new Item();
         item.SetDefaults(type);
-        if (item.type != type || item.maxStack <= 0 || count > (long)item.maxStack * MaxTakeItems)
+        if (item.type != type || item.maxStack <= 0 || count > (long)item.maxStack * config.MaxRemotePutStacks)
         {
             return null;
         }
@@ -1207,9 +1207,10 @@ public static partial class NetworkSystem
         return SHA256.HashData(buffer.GetBuffer().AsSpan(0, (int)buffer.Length));
     }
 
-    private static bool WriteCommand(BinaryWriter writer, Command command)
+    // Fingerprints omit runtime budgets so existing requests can still be replayed after a limit changes.
+    private static bool WriteCommand(BinaryWriter writer, Command command, StoreConfig config = null)
     {
-        if (!ValidateCommand(command) || command.Kind == CommandKind.Put)
+        if (!ValidateCommand(command, config) || command.Kind == CommandKind.Put)
         {
             return false;
         }
@@ -1267,7 +1268,7 @@ public static partial class NetworkSystem
         }
     }
 
-    private static bool ValidateCommand(Command command)
+    private static bool ValidateCommand(Command command, StoreConfig config = null)
     {
         if (command is null)
         {
@@ -1277,20 +1278,22 @@ public static partial class NetworkSystem
         return command.Kind switch
         {
             CommandKind.QueryType when command.InputPayload is QueryTypePayload query => ValidType(query.Type),
-            CommandKind.QuerySlot when command.InputPayload is QuerySlotPayload slots => ValidSlots(slots.Slots),
+            CommandKind.QuerySlot when command.InputPayload is QuerySlotPayload slots => ValidSlots(slots.Slots, config),
             CommandKind.Move when command.InputPayload is MovePayload move => move.SourceSlot != move.DestinationSlot &&
                 ValidSlot(move.SourceSlot) && ValidSlot(move.DestinationSlot),
             CommandKind.Take when command.InputPayload is TakePayload take => ValidType(take.Type) &&
-                take.Count > 0 && (command.Access.IsStrong ? ValidSlots(command.Access.Slots) : take.Count <= MaxTakeItems),
-            CommandKind.Put when command.InputPayload is PutPayload put => ValidPut(put) &&
-                (!command.Access.IsStrong || ValidSlots(command.Access.Slots)),
+                take.Count > 0 && (command.Access.IsStrong
+                    ? ValidSlots(command.Access.Slots, config)
+                    : config is null || take.Count <= config.MaxRemoteTakeItems),
+            CommandKind.Put when config is not null && command.InputPayload is PutPayload put =>
+                ValidPut(put, config.MaxRemotePutStacks) && (!command.Access.IsStrong || ValidSlots(command.Access.Slots, config)),
             _ => false
         };
     }
 
-    private static bool ValidPut(PutPayload put)
+    private static bool ValidPut(PutPayload put, int maxStacks)
     {
-        if (put.Items is null || put.Items.Count == 0 || put.Items.Count > MaxTakeItems)
+        if (put.Items is null || put.Items.Count == 0 || put.Items.Count > maxStacks)
         {
             return false;
         }
@@ -1304,7 +1307,7 @@ public static partial class NetworkSystem
             }
 
             stacks += (item.stack + (long)item.maxStack - 1) / item.maxStack;
-            if (stacks > MaxTakeItems)
+            if (stacks > maxStacks)
             {
                 return false;
             }
@@ -1317,9 +1320,9 @@ public static partial class NetworkSystem
 
     private static bool ValidSlot(int slot) => slot >= 0 && slot / ItemPage.SlotCount < PageDirectory.MaxPageCount;
 
-    private static bool ValidSlots(int[] slots)
+    private static bool ValidSlots(int[] slots, StoreConfig config)
     {
-        if (slots is null || slots.Length == 0 || slots.Length > MaxRemoteSlots)
+        if (slots is null || slots.Length == 0 || slots.Length > MaxWireSlots || (config is not null && slots.Length > config.MaxRemoteCommandSlots))
         {
             return false;
         }
@@ -1339,7 +1342,7 @@ public static partial class NetworkSystem
     private static int[] ReadSlots(BinaryReader reader)
     {
         var count = reader.ReadUInt16();
-        if (count > MaxRemoteSlots)
+        if (count > MaxWireSlots)
         {
             throw new InvalidDataException("Too many warehouse slots.");
         }

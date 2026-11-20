@@ -21,7 +21,7 @@ internal sealed class ClientOperationJournal
     private const int HeaderSize = 4 + 16 + 16 + 16 + 8 + 4;
     private const int EntrySize = 1 + 16 + 8;
     private const int HashSize = 32;
-    private const int MaxPending = 4096;
+    internal const int MaxFileEntries = 4096;
 
     private readonly object _gate = new();
     private readonly string _path;
@@ -145,7 +145,7 @@ internal sealed class ClientOperationJournal
                 }
 
                 long floor = Math.Max(_state.LastSequence, serverHighWatermark);
-                if (floor == long.MaxValue || _state.Pending.Count >= MaxPending)
+                if (floor == long.MaxValue || _state.Pending.Count >= StoreConfig.Runtime.MaxClientPendingOperations)
                 {
                     return false;
                 }
@@ -219,7 +219,7 @@ internal sealed class ClientOperationJournal
     {
         using var file = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read);
         long length = file.Length;
-        if (length < HeaderSize + HashSize || length > HeaderSize + MaxPending * EntrySize + HashSize)
+        if (length < HeaderSize + HashSize || length > HeaderSize + MaxFileEntries * EntrySize + HashSize)
         {
             throw new InvalidDataException("Invalid client operation journal length.");
         }
@@ -242,7 +242,7 @@ internal sealed class ClientOperationJournal
         Guid lineage = ReadGuid(reader);
         long lastSequence = reader.ReadInt64();
         int count = reader.ReadInt32();
-        if (lineage == Guid.Empty || lastSequence < 0 || count < 0 || count > MaxPending ||
+        if (lineage == Guid.Empty || lastSequence < 0 || count < 0 || count > MaxFileEntries ||
             payload.Length != HeaderSize + count * EntrySize)
         {
             throw new InvalidDataException("Invalid client operation journal header.");

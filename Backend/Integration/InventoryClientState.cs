@@ -24,7 +24,7 @@ public static class InventoryClientState
     // Positive values fence rejected generations. Negative values fence uncertain application after a crash.
     private const string GrantGenerationPrefix = "g/";
     private const int ReceiptKeyLength = 67;
-    private const int MaxReceiptCount = 32_768;
+    private static int MaxReceiptCount => StoreConfig.Runtime.MaxClientDeliveryReceipts;
 
     internal static void LoadPlayerReceipts(TagCompound tag, Dictionary<string, byte[]> destination)
     {

@@ -13,8 +13,8 @@ internal sealed class TransactionLedger
     private const int EntryBytes = 16 + 16 + FingerprintLength + 1 + 1 + 1 + sizeof(int);
     private const int SequenceBytes = sizeof(long);
     private const int FloorBytes = 16 + SequenceBytes;
-    private const int MaxBytes = 32 * 1024 * 1024;
-    private const int MaxEntries = 32_768;
+    private const int MaxFileBytes = Storage.StoreRedoJournal.MaxLedgerBytes;
+    internal const int MaxFileEntries = 32_768;
 
     internal readonly record struct Key(Guid Player, Guid Request);
     internal sealed record Entry(byte[] Fingerprint, bool Deliver, bool Acknowledged, byte[] Result,
@@ -52,17 +52,22 @@ internal sealed class TransactionLedger
     private readonly Dictionary<Key, Entry> _entries = new();
     private readonly Dictionary<Guid, long> _retiredThrough = new();
     private readonly Dictionary<Guid, long> _highestSequences = new();
+    private readonly int _entryBudget;
+    private readonly int _byteBudget;
     private int _size = HeaderBytes;
     private long _revision;
 
-    internal TransactionLedger(byte[] contents)
+    internal TransactionLedger(byte[] contents, StoreConfig config = null)
     {
+        config ??= new StoreConfig();
+        _entryBudget = Math.Min(MaxFileEntries, config.MaxTransactionLedgerEntries);
+        _byteBudget = Math.Min(MaxFileBytes, config.MaxTransactionLedgerBytes);
         if (contents is null)
         {
             return;
         }
 
-        if (contents.Length > MaxBytes)
+        if (contents.Length > MaxFileBytes)
         {
             throw new InvalidDataException("Transaction ledger is too large.");
         }
@@ -75,7 +80,7 @@ internal sealed class TransactionLedger
         }
 
         var count = reader.ReadInt32();
-        if (count < 0 || count > MaxEntries)
+        if (count < 0 || count > MaxFileEntries)
         {
             throw new InvalidDataException("Invalid transaction ledger entry count.");
         }
@@ -209,7 +214,7 @@ internal sealed class TransactionLedger
         return LookupStatus.Fresh;
     }
 
-    internal bool HasRoom => _entries.Count < MaxEntries && _size + EntryBytes < MaxBytes;
+    internal bool HasRoom => _entries.Count < _entryBudget && _size + EntryBytes < _byteBudget;
 
     // Projection only. Publish the in-memory change after the store's commit marker is durable.
     internal byte[] Encode(Key key, Entry entry)
@@ -277,7 +282,7 @@ internal sealed class TransactionLedger
             length -= EntryBytes + SequenceBytes + entry.Result.Length;
         }
 
-        if (length > MaxBytes)
+        if (length > MaxFileBytes)
         {
             return false;
         }
@@ -343,7 +348,7 @@ internal sealed class TransactionLedger
             length += EntryBytes + (entry.Sequence.HasValue ? sizeof(long) : 0);
         }
 
-        if (length > MaxBytes || !replacing && _entries.Count >= MaxEntries)
+        if (length > MaxFileBytes || !replacing && (_entries.Count >= _entryBudget || length > _byteBudget))
         {
             throw new InvalidDataException("Transaction ledger capacity reached.");
         }

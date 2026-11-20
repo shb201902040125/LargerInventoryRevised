@@ -23,15 +23,17 @@ internal sealed partial class CommandExecutor
     private int TryExecuteConcurrentWave(List<Command> batch, int start, HashSet<int> pinnedPages,
         HashSet<int> touchedPages)
     {
-        var limit = Math.Min(Math.Clamp(_store.Config.MaxConcurrentCommandsPerBatch, 1, SlotConflictWave.MaxCommands),
+        var limit = Math.Min(Math.Clamp(_store.Config.MaxConcurrentCommandsPerBatch, 1, StoreConfig.MaxSupportedConcurrentCommands),
             batch.Count - start);
-        if (limit < 2 || !CanSchedule(batch[start], out _) || !CanSchedule(batch[start + 1], out _)) return 0;
+        if (limit < 2) return 0;
+        var slotLimit = Math.Clamp(_store.Config.MaxConcurrentSlotsPerCommand, 1, StoreConfig.MaxSupportedConcurrentSlots);
+        if (!CanSchedule(batch[start], slotLimit, out _) || !CanSchedule(batch[start + 1], slotLimit, out _)) return 0;
 
         var wave = new SlotConflictWave();
         while (wave.Count < limit)
         {
             var command = batch[start + wave.Count];
-            if (!CanSchedule(command, out var readOnly) || !wave.TryAdd(command.Access.Slots, readOnly)) break;
+            if (!CanSchedule(command, slotLimit, out var readOnly) || !wave.TryAdd(command.Access.Slots, readOnly)) break;
         }
         if (wave.Count < 2) return 0;
 
@@ -43,7 +45,7 @@ internal sealed partial class CommandExecutor
             if (!Validate(command, out _)) return 0;
         }
 
-        Span<int> acquired = stackalloc int[SlotConflictWave.MaxCommands * SlotConflictWave.MaxSlotsPerCommand];
+        Span<int> acquired = stackalloc int[StoreConfig.MaxSupportedConcurrentCommands * StoreConfig.MaxSupportedConcurrentSlots];
         var acquiredCount = 0;
         for (var i = 0; i < wave.Count; i++)
         {
@@ -99,20 +101,18 @@ internal sealed partial class CommandExecutor
             work[i].Publish(this, touchedPages);
             work[i].Command.Complete(result);
         }
-        _store.SyncSummaries(touchedPages);
-        touchedPages.Clear();
         return work.Length;
     }
 
-    private static bool CanSchedule(Command command, out bool readOnly)
+    private static bool CanSchedule(Command command, int slotLimit, out bool readOnly)
     {
         readOnly = command.Kind == CommandKind.QuerySlot || command.InputPayload is EscapePayload { ReadOnly: true };
-        if (!command.Access.IsStrong || command.Access.Slots.Length is 0 or > SlotConflictWave.MaxSlotsPerCommand)
+        if (!command.Access.IsStrong || command.Access.Slots.Length == 0 || command.Access.Slots.Length > slotLimit)
             return false;
         return command.Kind switch
         {
             CommandKind.QuerySlot or CommandKind.Take or CommandKind.Move => true,
-            CommandKind.Put => command.InputPayload is PutPayload { Items.Count: <= SlotConflictWave.MaxSlotsPerCommand },
+            CommandKind.Put => command.InputPayload is PutPayload { Items: { } items } && items.Count <= slotLimit,
             CommandKind.Escape => command.InputPayload is EscapePayload { Concurrent: true },
             _ => false
         };

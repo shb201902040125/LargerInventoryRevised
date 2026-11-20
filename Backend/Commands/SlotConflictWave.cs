@@ -5,9 +5,6 @@ namespace LargerInventory.Backend.Commands;
 /// <summary>Tracks whether slot access can join the current bounded wave.</summary>
 internal struct SlotConflictWave
 {
-    public const int MaxSlotsPerCommand = 16;
-    public const int MaxCommands = 4;
-
     private ulong _occupied;
     private ulong _writes;
 
@@ -15,7 +12,7 @@ internal struct SlotConflictWave
 
     public bool TryAdd(ReadOnlySpan<int> slots, bool readOnly)
     {
-        if (Count >= MaxCommands || slots.Length > MaxSlotsPerCommand)
+        if (Count >= StoreConfig.MaxSupportedConcurrentCommands || slots.Length > StoreConfig.MaxSupportedConcurrentSlots)
         {
             return false;
         }

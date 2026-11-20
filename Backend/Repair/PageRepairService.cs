@@ -6,7 +6,7 @@ using LargerInventory.Backend.Storage;
 
 namespace LargerInventory.Backend.Repair;
 
-/// <summary>Runs one repair step per pump under the store execution gate. ItemIO stays on the owner thread.</summary>
+/// <summary>Runs bounded repair work under the store execution gate. ItemIO stays on the owner thread.</summary>
 internal sealed class PageRepairService : IDisposable
 {
     private readonly InventoryStore _store;
@@ -63,18 +63,21 @@ internal sealed class PageRepairService : IDisposable
     {
         if (!_running)
             return;
-        if (!_cancel && _pending.TryDequeue(out var next))
+        var config = _store.Config;
+        // A page requeued after contention should wait until the next pump.
+        var budget = Math.Min(config.MaxRepairPagesPerPump, _pending.Count);
+        for (var attempt = 0; attempt < budget && !_cancel && _pending.TryDequeue(out var next); attempt++)
         {
             if (!_store.PageLocks.TryEnter(next.Index))
             {
-                if (next.Attempts < 2)
+                if (next.Attempts < config.MaxRepairPageLockRetries)
                     _pending.Enqueue((next.Index, next.Attempts + 1));
                 else
                 {
                     _lockFailed.Add(next.Index);
                     _report.LockFailedPages++;
                 }
-                return;
+                continue;
             }
             var changed = false;
             try

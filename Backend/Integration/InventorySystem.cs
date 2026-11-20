@@ -26,9 +26,7 @@ public sealed class InventorySystem : ModSystem
     public Guid WorldId { get; private set; }
     public InventoryStore WorldStore { get; private set; }
 
-    private const long PlayerStoreIdleMs = 60_000;
-    private const long PlayerStoreCheckIntervalMs = 1_000;
-    private const long PlayerStoreCloseRetryMs = 60_000;
+    internal StoreConfig Config => StoreConfig.Runtime;
 
     private readonly object _storesGate = new();
     private readonly ConcurrentQueue<Action> _mainThreadActions = new();
@@ -41,8 +39,6 @@ public sealed class InventorySystem : ModSystem
     private long _nextIdlePlayerStoreCheck;
     private readonly Dictionary<int, (InventoryPlayer Player, Guid Id)> _serverBindings = new();
     private InventoryPlayer _localPlayer;
-    private const long ServerSaveIntervalMs = 60_000;
-    private const int ServerSaveStaggerMs = 4_000;
     private readonly ConditionalWeakTable<InventoryStore, PeriodicSaveDeadline> _serverSaveDeadlines = new();
 
     private sealed class PeriodicSaveDeadline(long next)
@@ -86,6 +82,7 @@ public sealed class InventorySystem : ModSystem
 
     public override void OnModLoad()
     {
+        Config.Normalize();
         Instance = this;
         On_Player.SavePlayer += OnSavePlayer;
         On_WorldGen.SaveAndQuit += OnSaveAndQuit;
@@ -228,7 +225,7 @@ public sealed class InventorySystem : ModSystem
         binding.Player.Store = null;
         if (!_serverBindings.Values.Any(other => other.Id == binding.Id))
         {
-            _idlePlayerStoreDeadlines[binding.Id] = Environment.TickCount64 + PlayerStoreIdleMs;
+            _idlePlayerStoreDeadlines[binding.Id] = Environment.TickCount64 + Config.PlayerStoreIdleMs;
         }
     }
 
@@ -322,7 +319,7 @@ public sealed class InventorySystem : ModSystem
 
         if (Environment.TickCount64 >= _nextCloseRetry)
         {
-            _nextCloseRetry = Environment.TickCount64 + 60_000;
+            _nextCloseRetry = Environment.TickCount64 + Config.StoreCloseRetryMs;
             RetryClosingStores();
         }
 
@@ -350,19 +347,23 @@ public sealed class InventorySystem : ModSystem
             var now = Environment.TickCount64;
             foreach (var store in stores)
             {
-                var deadline = _serverSaveDeadlines.GetValue(store, static key => new PeriodicSaveDeadline(
-                    Environment.TickCount64 + ServerSaveIntervalMs - ServerSaveStaggerMs +
-                    unchecked((uint)RuntimeHelpers.GetHashCode(key)) % ServerSaveStaggerMs));
+                if (!_serverSaveDeadlines.TryGetValue(store, out var deadline))
+                {
+                    var stagger = Config.ServerSaveStaggerMs;
+                    var offset = stagger == 0 ? 0 : (int)(unchecked((uint)RuntimeHelpers.GetHashCode(store)) % (uint)stagger);
+                    deadline = new PeriodicSaveDeadline(now + Config.ServerSaveIntervalMs - stagger + offset);
+                    _serverSaveDeadlines.Add(store, deadline);
+                }
                 if (now < deadline.Next)
                     continue;
 
-                deadline.Next = now + ServerSaveIntervalMs;
+                deadline.Next = now + Config.ServerSaveIntervalMs;
                 store.SchedulePeriodicSave();
             }
 
             if (now >= _nextIdlePlayerStoreCheck)
             {
-                _nextIdlePlayerStoreCheck = now + PlayerStoreCheckIntervalMs;
+                _nextIdlePlayerStoreCheck = now + Config.PlayerStoreCheckIntervalMs;
                 CloseIdlePlayerStores(now);
             }
         }
@@ -384,7 +385,7 @@ public sealed class InventorySystem : ModSystem
                 if (!TryDisposeStore(store))
                 {
                     // Keep the same instance available for pumping, reconnects, and retries.
-                    _idlePlayerStoreDeadlines[playerId] = Environment.TickCount64 + PlayerStoreCloseRetryMs;
+                    _idlePlayerStoreDeadlines[playerId] = Environment.TickCount64 + Config.PlayerStoreCloseRetryMs;
                     continue;
                 }
 
@@ -416,7 +417,7 @@ public sealed class InventorySystem : ModSystem
     private InventoryStore OpenStore(string directory, StoreScope scope)
     {
         EnsureClosed(directory);
-        var store = new InventoryStore(new StoreConfig(), directory, scope);
+        var store = new InventoryStore(Config.Copy(), directory, scope);
         try
         {
             store.Start();
