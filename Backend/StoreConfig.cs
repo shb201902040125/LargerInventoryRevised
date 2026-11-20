@@ -22,6 +22,9 @@ public sealed class StoreConfig
     /// <summary>一次划批最多包含的指令数（控制单批执行量，不是背压）。</summary>
     public int MaxBatchCommands { get; set; } = 256;
 
+    /// <summary>同一批次内最多同时运行的独立指令数。设为 1 可关闭并发。</summary>
+    public int MaxConcurrentCommandsPerBatch { get; set; } = 4;
+
     /// <summary>每次 Pump 最多连续处理的批数，防止回调不断投递指令时长时间占用主线程。</summary>
     public int MaxBatchesPerPump { get; set; } = 16;
 

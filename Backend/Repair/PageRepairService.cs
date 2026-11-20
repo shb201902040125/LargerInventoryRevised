@@ -76,11 +76,11 @@ internal sealed class PageRepairService : IDisposable
                 }
                 return;
             }
+            var changed = false;
             try
             {
                 _report.ScannedPages++;
-                if (Repair(next.Index))
-                    Notify(() => _pageChanged?.Invoke(next.Index));
+                changed = Repair(next.Index);
             }
             catch (Exception e)
             {
@@ -90,6 +90,10 @@ internal sealed class PageRepairService : IDisposable
                 Log.Error($"Could not repair page {next.Index}.", e);
             }
             finally { _store.PageLocks.Exit(next.Index); }
+
+            // The callback can load the repaired page. Pump still holds the store execution gate.
+            if (changed)
+                Notify(() => _pageChanged?.Invoke(next.Index));
         }
         if (_cancel || _pending.Count == 0)
             Finish();

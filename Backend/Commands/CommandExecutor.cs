@@ -10,11 +10,10 @@ using Terraria.ModLoader;
 namespace LargerInventory.Backend.Commands;
 
 /// <summary>
-/// 指令执行器（无后台线程）。所有 Item、ItemLoader、ItemIO 及模组 Hook 调用都发生在调用
-/// <see cref="Pump"/> / <see cref="Drain"/> 的线程上，即 Terraria 主线程；指令回调也在同一线程执行。
-/// 执行与存档共用 <see cref="_executeGate"/>，保证存档不会与执行交错。
+/// 调用 <see cref="Pump"/> / <see cref="Drain"/> 的线程负责页加载、发布槽位更新和结果回调。
+/// 批内独立槽位操作可在工作线程执行。执行与存档共用 <see cref="_executeGate"/>。
 /// </summary>
-internal sealed class CommandExecutor
+internal sealed partial class CommandExecutor
 {
     private const int MaxDrainBatches = 1024;
 
@@ -22,7 +21,9 @@ internal sealed class CommandExecutor
     private readonly CommandQueue _queue;
     private readonly object _executeGate = new();
     private volatile int _executingThreadId;
-    private HashSet<int> _activeLocks;
+    // Only the executor owner accesses these sets. FIFO commands share the batch's page leases.
+    private readonly HashSet<int> _batchPages = new();
+    private readonly HashSet<int> _reservedSlots = new();
     private bool _pageBusyHit;
     private bool _pageLoadFailedHit;
     private long _pageWork;
@@ -137,7 +138,7 @@ internal sealed class CommandExecutor
     /// </summary>
     public bool TryAcquireForSave(int timeoutMs)
     {
-        if (_executingThreadId == Environment.CurrentManagedThreadId)
+        if (ReferenceEquals(_workerExecutor, this) || _executingThreadId == Environment.CurrentManagedThreadId)
         {
             return false;
         }
@@ -206,6 +207,13 @@ internal sealed class CommandExecutor
                     break;
                 }
 
+                var parallelCount = TryExecuteConcurrentWave(batch, index, pinnedPages, touchedPages);
+                if (parallelCount != 0)
+                {
+                    index += parallelCount - 1;
+                    continue;
+                }
+
                 var command = batch[index];
                 if (!Validate(command, out var validationResult))
                 {
@@ -213,30 +221,23 @@ internal sealed class CommandExecutor
                     continue;
                 }
 
-                var locks = new HashSet<int>();
-                if (!TryLockCommandPages(command, locks))
-                {
-                    // 修复服务正在独占该页：本次指令不执行，按 PageBusy 失败。
-                    command.Complete(Command.FailUnexecuted(command, CommandStatus.PageBusy));
-                    continue;
-                }
-
-                _activeLocks = locks;
                 _pageBusyHit = false;
                 _pageLoadFailedHit = false;
                 try
                 {
+                    if (command.Access.IsStrong && !TryReserveStrongSlots(command.Access))
+                    {
+                        command.Complete(Command.FailUnexecuted(command, CommandStatus.PageBusy));
+                        continue;
+                    }
+
                     ExecuteCommandSafe(command, touchedPages, pinnedPages);
                     _store.SyncSummaries(touchedPages);
                     touchedPages.Clear();
                 }
                 finally
                 {
-                    _activeLocks = null;
-                    foreach (var pageIndex in locks)
-                    {
-                        _store.PageLocks.Exit(pageIndex);
-                    }
+                    _reservedSlots.Clear();
                 }
             }
         }
@@ -253,9 +254,24 @@ internal sealed class CommandExecutor
         }
         finally
         {
-            _store.SyncSummaries(touchedPages);
-            _store.PageCache.UnpinAll();
-            _store.CaptureDirtyPageSnapshots();
+            try
+            {
+                _store.SyncSummaries(touchedPages);
+                _store.CaptureDirtyPageSnapshots();
+            }
+            finally
+            {
+                try
+                {
+                    _store.PageCache.UnpinAll();
+                }
+                finally
+                {
+                    foreach (var pageIndex in _batchPages)
+                        _store.PageLocks.ExitUse(pageIndex);
+                    _batchPages.Clear();
+                }
+            }
         }
 
         if (!notify) return;
@@ -266,42 +282,48 @@ internal sealed class CommandExecutor
         }
     }
 
-    /// <summary>按页索引升序获取该指令需要的所有页锁；任一失败则释放并返回 false。</summary>
-    private bool TryLockCommandPages(Command command, HashSet<int> locks)
+    private bool TryReserveStrongSlots(AccessSet access)
     {
-        var pages = new SortedSet<int>();
-        foreach (var pageIndex in EnumerateLockedPages(command))
+        // Acquire every required page before a strong command can modify any slot.
+        var acquired = new List<int>();
+        foreach (var pageIndex in access.Slots.Select(PageOf).Distinct().Order())
         {
-            if (pageIndex >= 0)
+            if (_batchPages.Contains(pageIndex)) continue;
+            _pageWork++;
+            if (!_store.PageLocks.TryEnterUse(pageIndex))
             {
-                pages.Add(pageIndex);
+                foreach (var held in acquired)
+                    _store.PageLocks.ExitUse(held);
+                return false;
             }
+            acquired.Add(pageIndex);
         }
 
-        foreach (var pageIndex in pages)
+        _batchPages.UnionWith(acquired);
+        _reservedSlots.UnionWith(access.Slots);
+        return true;
+    }
+
+    private void ReserveSlot(ItemPage page, int slot, HashSet<int> pinnedPages)
+    {
+        // The caller holds either the batch lease or a temporary probe lease.
+        if (!_batchPages.Contains(page.PageIndex))
+        {
+            if (!_store.PageLocks.TryEnterUse(page.PageIndex))
+                throw new InvalidOperationException("Cannot retain the current page lease.");
+            _batchPages.Add(page.PageIndex);
+        }
+        _reservedSlots.Add((page.PageIndex << 10) | slot);
+        PinForBatch(page.PageIndex, pinnedPages);
+    }
+
+    private void PinForBatch(int pageIndex, HashSet<int> pinnedPages)
+    {
+        if (pinnedPages.Add(pageIndex))
         {
             _pageWork++;
-
-            if (!_store.PageLocks.TryEnter(pageIndex))
-            {
-                // 强指定指令必须有这些页；弱指定指令可以跳过忙碌页，继续使用其它页。
-                if (command.Access.IsStrong)
-                {
-                    foreach (var held in locks)
-                    {
-                        _store.PageLocks.Exit(held);
-                    }
-
-                    return false;
-                }
-
-                continue;
-            }
-
-            locks.Add(pageIndex);
+            _store.PinPage(pageIndex);
         }
-
-        return true;
     }
 
     private bool Validate(Command command, out CommandResult failure)
@@ -343,50 +365,6 @@ internal sealed class CommandExecutor
         return valid;
     }
 
-    private IEnumerable<int> EnumerateLockedPages(Command command)
-    {
-        if (command.Access.IsStrong)
-        {
-            foreach (var slot in command.Access.Slots)
-            {
-                if (slot >= 0)
-                {
-                    yield return PageOf(slot);
-                }
-            }
-
-            yield break;
-        }
-
-        foreach (var pageIndex in EnumerateRequiredPages(command))
-        {
-            yield return pageIndex;
-        }
-    }
-
-    /// <summary>执行期动态遇到的页（例如 Put spill 新页）也必须立即加锁，避免中途被修复服务锁定。</summary>
-    private bool EnsureActivePageLock(int pageIndex)
-    {
-        if (_activeLocks is null)
-        {
-            return false;
-        }
-
-        if (_activeLocks.Contains(pageIndex))
-        {
-            return true;
-        }
-
-        if (!_store.PageLocks.TryEnter(pageIndex))
-        {
-            _pageBusyHit = true;
-            return false;
-        }
-
-        _activeLocks.Add(pageIndex);
-        return true;
-    }
-
     private static void CompleteAndNotify(Command command, CommandResult result)
     {
         command.Complete(result);
@@ -418,104 +396,14 @@ internal sealed class CommandExecutor
             result = Command.FailUnexecuted(command, CommandStatus.InternalError);
         }
 
-        if (_pageBusyHit)
-        {
+        // A weak placement that met its full request can ignore unavailable candidates.
+        var fulfilled = !command.Access.IsStrong && result.IsOk &&
+            (command.Kind == CommandKind.Put || command.InputPayload is TakePayload { Count: < int.MaxValue });
+        if (!fulfilled && _pageBusyHit)
             result = new CommandResult(result.Status | CommandStatus.PageBusy, result.ResultPayload);
-        }
-
-        if (_pageLoadFailedHit) result = new CommandResult(result.Status | CommandStatus.PageLoadFailed, result.ResultPayload);
+        if (!fulfilled && _pageLoadFailedHit)
+            result = new CommandResult(result.Status | CommandStatus.PageLoadFailed, result.ResultPayload);
         command.Complete(result);
-    }
-
-    private IEnumerable<int> EnumerateRequiredPages(Command command)
-    {
-        switch (command.Kind)
-        {
-            // QuerySlot 只读，按需加载即可；预加载会让一次查询对同一坏页记录两次失败日志。
-            case CommandKind.Move:
-            case CommandKind.Escape when command.Access.IsStrong:
-                if (command.Access.IsStrong)
-                {
-                    foreach (var slot in command.Access.Slots)
-                    {
-                        if (slot >= 0)
-                        {
-                            yield return PageOf(slot);
-                        }
-                    }
-                }
-
-                break;
-
-            case CommandKind.Take:
-                foreach (var pageIndex in EnumeratePagesWithType(GetTakeType(command)))
-                {
-                    yield return pageIndex;
-                }
-
-                break;
-
-            case CommandKind.Escape:
-                foreach (var pageIndex in EnumeratePagesWithType(GetTakeType(command)))
-                {
-                    yield return pageIndex;
-                }
-
-                break;
-
-            case CommandKind.Put:
-                if (command.InputPayload is PutPayload put)
-                {
-                    if (command.Access.IsStrong)
-                    {
-                        foreach (var slot in command.Access.Slots)
-                        {
-                            if (slot >= 0)
-                            {
-                                yield return PageOf(slot);
-                            }
-                        }
-                    }
-                    else
-                    {
-                        if (put.Items is not null)
-                        {
-                            foreach (var item in put.Items)
-                            {
-                                if (item is null || item.IsAir)
-                                {
-                                    continue;
-                                }
-
-                                foreach (var pageIndex in EnumeratePagesWithType(item.type))
-                                {
-                                    yield return pageIndex;
-                                }
-                            }
-                        }
-
-                        foreach (var page in _store.PageCache.AllocatedPages)
-                        {
-                            _pageWork++;
-                            if (page.Summary.FreeSlots > 0)
-                            {
-                                yield return page.PageIndex;
-                            }
-                        }
-                    }
-                }
-
-                break;
-        }
-    }
-
-    private static int GetTakeType(Command command)
-    {
-        return command.InputPayload switch
-        {
-            TakePayload take => take.Type,
-            _ => command.Access.Weak.Type
-        };
     }
 
     private IEnumerable<int> EnumeratePagesWithType(int type)
@@ -555,6 +443,8 @@ internal sealed class CommandExecutor
             CommandKind.Take => ExecuteTake(command, touchedPages, pinnedPages),
             CommandKind.Put => ExecutePut(command, touchedPages, pinnedPages),
             CommandKind.Move => ExecuteMove(command, touchedPages, pinnedPages),
+            CommandKind.Escape when command.InputPayload is EscapePayload { Concurrent: true } =>
+                ExecuteConcurrentEscape(command, touchedPages, pinnedPages),
             CommandKind.Escape => ExecuteEscape(command, touchedPages, pinnedPages),
             _ => CommandResult.Fail(CommandStatus.InvalidArg)
         };
@@ -659,19 +549,8 @@ internal sealed class CommandExecutor
         var status = CommandStatus.Ok;
         try
         {
-            foreach (var slotId in EnumerateCandidateSlots(command.Access, payload.Type))
+            foreach (var (page, index) in EnumerateItemSlots(command.Access, payload.Type, pinnedPages, payload.AvoidFavorited))
             {
-                if (!takeAll && remaining == 0)
-                {
-                    break;
-                }
-
-                if (!TryGetPageForSlot(slotId, pinnedPages, out var page))
-                {
-                    continue;
-                }
-
-                var index = SlotOf(slotId);
                 var item = page.Slots[index];
                 if (item.IsAir || (payload.AvoidFavorited && item.favorited))
                 {
@@ -685,6 +564,7 @@ internal sealed class CommandExecutor
                     continue;
                 }
 
+                ReserveSlot(page, index, pinnedPages);
                 var count = takeAll ? item.stack : Math.Min(item.stack, remaining);
                 if (count == item.stack)
                 {
@@ -701,6 +581,7 @@ internal sealed class CommandExecutor
 
                 if (!takeAll) remaining -= count;
                 MarkChanged(page, touchedPages);
+                if (!takeAll && remaining == 0) break;
             }
         }
         catch (Exception e)
@@ -713,7 +594,8 @@ internal sealed class CommandExecutor
         {
             status |= CommandStatus.NotEnough;
         }
-        if (results.Count > 0 && (status != CommandStatus.Ok || _pageBusyHit || _pageLoadFailedHit))
+        var fulfilled = !command.Access.IsStrong && !takeAll && remaining == 0;
+        if (results.Count > 0 && (status != CommandStatus.Ok || (!fulfilled && (_pageBusyHit || _pageLoadFailedHit))))
         {
             status |= CommandStatus.Partial;
         }
@@ -731,6 +613,7 @@ internal sealed class CommandExecutor
 
         void Place(ItemPage page, int slot, Item item)
         {
+            ReserveSlot(page, slot, pinnedPages);
             originalSlots.TryAdd((page, slot), page.Slots[slot]);
             changedPages.Add(page.PageIndex);
             page.Slots[slot] = item;
@@ -742,64 +625,98 @@ internal sealed class CommandExecutor
             {
                 var source = input;
                 var blocked = CommandStatus.Ok;
-                foreach (var slotId in EnumerateMergeCandidates(command.Access, source.type, changedPages))
-                {
-                    if (source.IsAir) break;
-                    if (!TryGetPageForSlot(slotId, pinnedPages, out var page)) continue;
 
-                    var slot = SlotOf(slotId);
+                void MergeInto(ItemPage page, int slot)
+                {
                     var destination = page.Slots[slot];
-                    if (destination.IsAir) continue;
-                    if (source.type != destination.type)
+                    if (destination.IsAir) return;
+                    if (destination.type != source.type)
                     {
                         blocked |= CommandStatus.TargetOccupied | CommandStatus.TypeMismatch;
-                        continue;
+                        return;
                     }
                     if (destination.stack >= destination.maxStack)
                     {
                         blocked |= CommandStatus.TargetOccupied;
-                        continue;
+                        return;
                     }
                     if (!TryMerge(destination, source, out var nextDestination, out var nextSource, out _))
                     {
                         blocked |= CommandStatus.TargetOccupied | CommandStatus.TypeMismatch;
-                        continue;
+                        return;
                     }
-
                     Place(page, slot, nextDestination);
                     source = nextSource;
                 }
 
-                // Avoid advancing the empty-slot iterator after a complete transfer, which could allocate a new page.
-                while (!source.IsAir)
+                void FillEmpty(ItemPage page, int slot)
                 {
-                    using var emptySlots = EnumerateEmptySlots(command.Access, payload.Spill, pinnedPages, newPages).GetEnumerator();
-                    var placed = false;
-                    while (!source.IsAir && emptySlots.MoveNext())
+                    if (!page.Slots[slot].IsAir) return;
+                    if (source.stack <= source.maxStack)
                     {
-                        var slotId = emptySlots.Current;
-                        if (!TryGetPageForSlot(slotId, pinnedPages, out var page)) continue;
-
-                        var slot = SlotOf(slotId);
-                        if (!page.Slots[slot].IsAir) continue;
-                        if (source.stack <= source.maxStack)
-                        {
-                            Place(page, slot, source);
-                            source = null;
-                        }
-                        else
-                        {
-                            var nextSource = source.Clone();
-                            Place(page, slot, Split(nextSource, source.maxStack));
-                            source = nextSource;
-                        }
-                        placed = true;
-                        if (source is null) break;
+                        Place(page, slot, source);
+                        source = null;
                     }
-                    if (source is null || !placed || command.Access.IsStrong || !payload.Spill) break;
+                    else
+                    {
+                        var remainder = source.Clone();
+                        Place(page, slot, Split(remainder, source.maxStack));
+                        source = remainder;
+                    }
                 }
 
-                if (source is not null && !source.IsAir)
+                bool HasRemainder() => source is not null && !source.IsAir;
+
+                void FillPage(ItemPage page)
+                {
+                    for (var slot = 0; slot < ItemPage.SlotCount && HasRemainder(); slot++)
+                        if (page.Slots[slot].type == source.type)
+                            MergeInto(page, slot);
+                    for (var slot = 0; slot < ItemPage.SlotCount && HasRemainder(); slot++)
+                        FillEmpty(page, slot);
+                }
+
+                if (command.Access.IsStrong)
+                {
+                    foreach (var slotId in command.Access.Slots)
+                    {
+                        if (!HasRemainder()) break;
+                        if (TryGetPageForSlot(slotId, pinnedPages, out var page))
+                            MergeInto(page, SlotOf(slotId));
+                    }
+                    foreach (var slotId in command.Access.Slots)
+                    {
+                        if (!HasRemainder()) break;
+                        if (TryGetPageForSlot(slotId, pinnedPages, out var page))
+                            FillEmpty(page, SlotOf(slotId));
+                    }
+                }
+                else
+                {
+                    foreach (var page in EnumeratePlacementPages(
+                        () => _store.PageCache.AllocatedPages.Select(page => page.PageIndex),
+                        page => EstimatePutCapacity(page, source)))
+                    {
+                        FillPage(page);
+                        if (!HasRemainder()) break;
+                    }
+
+                    while (HasRemainder() && payload.Spill)
+                    {
+                        var page = _store.AllocatePage(allowCapacityFailure: true);
+                        if (page is null) break;
+                        newPages.Add(page);
+                        if (!_store.PageLocks.TryEnterUse(page.PageIndex))
+                        {
+                            _pageBusyHit = true;
+                            break;
+                        }
+                        _batchPages.Add(page.PageIndex);
+                        FillPage(page);
+                    }
+                }
+
+                if (HasRemainder())
                 {
                     var status = CommandStatus.NoSpace;
                     if (command.Access.IsStrong)
@@ -835,8 +752,28 @@ internal sealed class CommandExecutor
                     continue;
                 _store.PageCache.RemoveNewPage(page);
                 pinnedPages.Remove(page.PageIndex);
+                if (_batchPages.Remove(page.PageIndex))
+                    _store.PageLocks.ExitUse(page.PageIndex);
             }
         }
+    }
+
+    private static long EstimatePutCapacity(ItemPage page, Item source)
+    {
+        // Cold pages have no stack limits in their summaries. Use type presence as a
+        // merge hint and check real stack limits and mod hooks once the page is loaded.
+        if (!page.Loaded)
+            return (long)page.Summary.FreeSlots * source.maxStack + (page.Summary.HasType(source.type) ? 1 : 0);
+
+        long capacity = 0;
+        foreach (var item in page.Slots)
+        {
+            if (item.IsAir)
+                capacity += source.maxStack;
+            else if (item.type == source.type)
+                capacity += Math.Max(0L, (long)item.maxStack - item.stack);
+        }
+        return capacity;
     }
 
     private static bool TryMerge(Item destination, Item source, out Item nextDestination, out Item nextSource, out int moved)
@@ -918,16 +855,12 @@ internal sealed class CommandExecutor
         }
 
         var items = new List<Item>();
-        foreach (var slotId in EnumerateCandidateSlots(command.Access, GetTakeType(command)))
+        foreach (var (page, slot) in EnumerateItemSlots(command.Access, command.Access.Weak.Type, pinnedPages))
         {
-            if (!TryGetPageForSlot(slotId, pinnedPages, out var page))
-            {
-                continue;
-            }
-
-            var item = page.Slots[SlotOf(slotId)];
+            var item = page.Slots[slot];
             if (!item.IsAir)
             {
+                ReserveSlot(page, slot, pinnedPages);
                 items.Add(item);
                 MarkChanged(page, touchedPages);
             }
@@ -944,190 +877,120 @@ internal sealed class CommandExecutor
         }
     }
 
-    private IEnumerable<int> EnumerateCandidateSlots(AccessSet access, int type)
+    private IEnumerable<(ItemPage Page, int Slot)> EnumerateItemSlots(AccessSet access, int type,
+        HashSet<int> pinnedPages, bool avoidFavorited = false)
     {
         if (access.IsStrong)
         {
-            foreach (var slot in access.Slots)
-            {
-                if (slot >= 0)
-                {
-                    yield return slot;
-                }
-            }
-
+            foreach (var slotId in access.Slots)
+                if (TryGetPageForSlot(slotId, pinnedPages, out var page))
+                    yield return (page, SlotOf(slotId));
             yield break;
         }
 
-        if (type <= 0)
+        long Estimate(ItemPage page)
         {
-            yield break;
+            if (!page.Summary.Types.TryGetValue(type, out var stat)) return 0;
+            if (!avoidFavorited || stat.ExactFavorites == 0) return stat.ExactCount;
+            if (!page.Loaded) return stat.ExactCount - stat.ExactFavorites;
+            long count = 0;
+            foreach (var item in page.Slots)
+                if (!item.IsAir && item.type == type && !item.favorited)
+                    count += item.stack;
+            return count;
         }
 
-        foreach (var pageIndex in EnumeratePagesWithType(type))
+        foreach (var page in EnumeratePlacementPages(() => EnumeratePagesWithType(type), Estimate))
         {
-            _pageWork++;
-            if (!_store.PageCache.Directory.TryGet(pageIndex, out var page))
+            for (var slot = 0; slot < ItemPage.SlotCount; slot++)
             {
-                continue;
-            }
-
-            for (var i = 0; i < ItemPage.SlotCount; i++)
-            {
-                if (page.Summary.SlotTypes[i] == type)
-                {
-                    yield return (pageIndex << 10) | i;
-                }
+                var item = page.Slots[slot];
+                if (!item.IsAir && item.type == type && page.Summary.SlotTypes[slot] == type &&
+                    !_reservedSlots.Contains((page.PageIndex << 10) | slot))
+                    yield return (page, slot);
             }
         }
     }
 
-    private IEnumerable<int> EnumerateMergeCandidates(AccessSet access, int type, HashSet<int> touchedPages)
+    private IEnumerable<ItemPage> EnumeratePlacementPages(Func<IEnumerable<int>> candidates, Func<ItemPage, long> estimate)
     {
-        if (access.IsStrong)
-        {
-            foreach (var slot in access.Slots)
-            {
-                yield return slot;
-            }
-            yield break;
-        }
+        foreach (var page in ProbePages(OrderPages(_batchPages, estimate)))
+            yield return page;
 
-        var modifiedPages = touchedPages.ToHashSet();
-        foreach (var slot in EnumerateCandidateSlots(access, type))
-        {
-            if (!modifiedPages.Contains(PageOf(slot))) yield return slot;
-        }
-        // Slots filled by earlier input items need to participate before the command's summary is rebuilt.
-        foreach (var pageIndex in modifiedPages)
+        // Candidate discovery is deferred until the retained pages cannot satisfy this request.
+        foreach (var page in ProbePages(OrderPages(candidates().Where(index => !_batchPages.Contains(index)), estimate)))
+            yield return page;
+    }
+
+    private int[] OrderPages(IEnumerable<int> indices, Func<ItemPage, long> estimate)
+    {
+        var ranked = new List<(int Index, long Capacity)>();
+        foreach (var index in indices)
         {
             _pageWork++;
-            if (!_store.PageCache.TryGetLoaded(pageIndex, out var page)) continue;
-            for (var index = 0; index < ItemPage.SlotCount; index++)
+            if (!_store.PageCache.Directory.TryGet(index, out var page) || page.LoadFailed) continue;
+            var capacity = estimate(page);
+            if (capacity > 0) ranked.Add((index, capacity));
+        }
+        return ranked.OrderByDescending(entry => entry.Capacity).ThenBy(entry => entry.Index)
+            .Select(entry => entry.Index).ToArray();
+    }
+
+    private IEnumerable<ItemPage> ProbePages(IEnumerable<int> indices)
+    {
+        foreach (var index in indices)
+        {
+            var temporary = !_batchPages.Contains(index);
+            if (temporary && !_store.PageLocks.TryEnterUse(index))
             {
-                if (!page.Slots[index].IsAir && page.Slots[index].type == type)
-                {
-                    yield return (pageIndex << 10) | index;
-                }
+                _pageBusyHit = true;
+                continue;
+            }
+
+            try
+            {
+                if (TryLoadPage(index, out var page)) yield return page;
+            }
+            finally
+            {
+                if (temporary) _store.PageLocks.ExitUse(index);
             }
         }
     }
 
-    private IEnumerable<int> EnumerateEmptySlots(AccessSet access, bool spill, HashSet<int> pinnedPages, List<ItemPage> newPages)
-    {
-        if (access.IsStrong)
-        {
-            foreach (var slot in access.Slots)
-            {
-                if (slot < 0)
-                {
-                    continue;
-                }
-
-                if (TryGetPageForSlot(slot, pinnedPages, out var page) && page.Slots[SlotOf(slot)].IsAir)
-                {
-                    yield return slot;
-                }
-            }
-
-            yield break;
-        }
-
-        foreach (var page in _store.PageCache.AllocatedPages.ToArray())
-        {
-            _pageWork++;
-            if (page.LoadFailed || page.Summary.FreeSlots <= 0)
-            {
-                continue;
-            }
-
-            if (!TryGetPageForSlot(page.PageIndex << 10, pinnedPages, out var loaded))
-            {
-                continue;
-            }
-
-            for (var i = 0; i < ItemPage.SlotCount; i++)
-            {
-                if (loaded.Slots[i].IsAir)
-                {
-                    yield return (loaded.PageIndex << 10) | i;
-                }
-            }
-        }
-
-        if (!spill)
-        {
-            yield break;
-        }
-
-        var newPage = _store.AllocatePage(allowCapacityFailure: true);
-        if (newPage is null)
-            yield break;
-
-        _pageWork++;
-        newPages.Add(newPage);
-        if (!EnsureActivePageLock(newPage.PageIndex))
-        {
-            yield break;
-        }
-
-        pinnedPages.Add(newPage.PageIndex);
-        _store.PinPage(newPage.PageIndex);
-        for (var i = 0; i < ItemPage.SlotCount; i++)
-        {
-            yield return (newPage.PageIndex << 10) | i;
-        }
-    }
-
-    /// <summary>
-    /// 获取槽位所在页。页无法加载（文件损坏、缺失等）时返回 false，调用方跳过该槽位，
-    /// 从而保证不会向不可读的页写入，也不会在命令中途抛出导致部分提交。
-    /// </summary>
     private bool TryGetPageForSlot(int slotId, HashSet<int> pinnedPages, out ItemPage page)
     {
         page = null;
-        if (slotId < 0)
-        {
+        var index = PageOf(slotId);
+        if (!_reservedSlots.Contains(slotId) || !_batchPages.Contains(index) || !TryLoadPage(index, out page))
             return false;
-        }
+        PinForBatch(index, pinnedPages);
+        return true;
+    }
 
-        var pageIndex = PageOf(slotId);
-        if (pageIndex < 0 || pageIndex >= PageDirectory.MaxPageCount)
+    private bool TryLoadPage(int pageIndex, out ItemPage page)
+    {
+        if (_store.PageCache.TryGetLoaded(pageIndex, out page))
         {
-            return false;
+            page.LastUsedMs = PageCache.NowMs();
+            return true;
         }
-
-        // 即使最终因锁忙碌而失败，也记录“该玩家请求过此页”，供修复完成后的变更通知使用。
-
-        // 页不存在时视为非法槽位，不能为了让查询成功而分配一个空页并写入 store.meta。
-        if (!_store.PageCache.Directory.Contains(pageIndex))
-        {
-            return false;
-        }
-
-        if (!EnsureActivePageLock(pageIndex))
-        {
-            return false;
-        }
-
         try
         {
+            _pageWork++;
             page = _store.EnsurePage(pageIndex);
+            return true;
+        }
+        catch (PageBusyException)
+        {
+            _pageBusyHit = true;
         }
         catch (PageLoadException e)
         {
             _pageLoadFailedHit = true;
-            Log.Error($"Page {pageIndex} unavailable; slot {slotId} skipped.", e);
-            return false;
+            Log.Error($"Page {pageIndex} unavailable; skipped.", e);
         }
-
-        if (pinnedPages.Add(pageIndex))
-        {
-            _pageWork++;
-            _store.PinPage(pageIndex);
-        }
-
-        return true;
+        return false;
     }
 
     private void MarkChanged(ItemPage page, HashSet<int> touchedPages)

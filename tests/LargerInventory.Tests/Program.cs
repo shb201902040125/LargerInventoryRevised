@@ -47,6 +47,8 @@ internal static partial class Program
         RunStorageTests();
         RunCommandTests();
         RunQueueP0Tests();
+        RunBatchPageTests();
+        RunBatchConcurrencyTests();
         Console.WriteLine($"Passed: {_passed}, Failed: {_failed}");
         return _failed == 0 ? 0 : 1;
     }

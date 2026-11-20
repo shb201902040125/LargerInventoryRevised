@@ -148,6 +148,8 @@ public sealed class MovePayload
 public sealed class EscapePayload
 {
     public Func<ICollection<Item>, CommandResult> Callback;
+    internal bool Concurrent { get; init; }
+    internal bool ReadOnly { get; init; }
 }
 
 public sealed class QuerySlotPayload
@@ -306,6 +308,18 @@ public static class CommandFactory
         return new Command(CommandKind.Move, timeoutMs,
             AccessSet.Strong(sourceSlot, destinationSlot),
             new MovePayload { SourceSlot = sourceSlot, DestinationSlot = destinationSlot }, callback);
+    }
+
+    /// <summary>
+    /// 对指定槽位的副本运行操作，可能在工作线程执行。集合按参数顺序包含空槽，
+    /// 支持按索引替换元素。只读操作丢弃更改，写操作仅在返回 Ok 后发布槽位。
+    /// 回调应自行同步共享状态，并且不能等待当前仓库中的后续命令。
+    /// </summary>
+    public static Command EscapeConcurrent(int[] slots, bool readOnly, Func<ICollection<Item>, CommandResult> action,
+        int timeoutMs = 0, Action<CommandResult> callback = null)
+    {
+        return new Command(CommandKind.Escape, timeoutMs, AccessSet.Strong(slots),
+            new EscapePayload { Callback = action, Concurrent = true, ReadOnly = readOnly }, callback);
     }
 
     public static Command Escape(int[] slots, Func<ICollection<Item>, CommandResult> action, int timeoutMs = 0,

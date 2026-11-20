@@ -34,38 +34,34 @@ internal sealed class PageCache
 
     public ItemPage EnsureLoaded(int pageIndex)
     {
-        var page = _directory.GetOrCreate(pageIndex);
-        if (page.Loaded)
-        {
-            page.LastUsedMs = NowMs();
-            return page;
-        }
-
-        // 与修复服务/其它调用共享页锁；主线程指令通常已持有该锁（Monitor 可重入）。
-        if (!_pageLocks.TryEnter(pageIndex))
-        {
-            throw new PageLoadException($"page {pageIndex} is busy");
-        }
+        // 指令可以已持有共享使用权。即使页已加载，此处也要避开独占修复。
+        if (!_pageLocks.TryEnterUse(pageIndex))
+            throw new PageBusyException(pageIndex);
 
         try
         {
-            try
+            var page = _directory.GetOrCreate(pageIndex);
+            if (!page.Loaded)
             {
-                LoadPage(page);
-            }
-            catch (PageLoadException)
-            {
-                page.LoadFailed = true;
-                throw;
+                try
+                {
+                    LoadPage(page);
+                }
+                catch (PageLoadException)
+                {
+                    page.LoadFailed = true;
+                    throw;
+                }
+
+                page.LoadFailed = false;
             }
 
-            page.LoadFailed = false;
             page.LastUsedMs = NowMs();
             return page;
         }
         finally
         {
-            _pageLocks.Exit(pageIndex);
+            _pageLocks.ExitUse(pageIndex);
         }
     }
 
@@ -283,4 +279,9 @@ internal sealed class PageCache
     {
         return Environment.TickCount64;
     }
+}
+
+internal sealed class PageBusyException : Exception
+{
+    public PageBusyException(int pageIndex) : base($"page {pageIndex} is busy") { }
 }

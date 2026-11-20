@@ -897,6 +897,10 @@ public sealed class InventoryStore : IDisposable
                     _reconciledCount++;
                     PageCache.TrimToLimit();
                 }
+                catch (PageBusyException)
+                {
+                    return false; // Retry the same page after its exclusive lease is released.
+                }
                 catch (PageLoadException e)
                 {
                     Log.Error($"Page {pageIndex} could not be loaded and will be skipped.", e);
@@ -973,7 +977,11 @@ public sealed class InventoryStore : IDisposable
                     {
                         if (_reloadCommittedPages)
                             ReloadCommittedPages();
-                        ReconcilePages(int.MaxValue);
+                        if (!ReconcilePages(int.MaxValue))
+                        {
+                            error = "page reconciliation is busy";
+                            return false;
+                        }
                     }
                     _executor.Drain();
                 }

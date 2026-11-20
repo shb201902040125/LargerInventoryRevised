@@ -5,34 +5,81 @@ using System.Threading;
 namespace LargerInventory.Backend.Storage;
 
 /// <summary>
-/// 页级独占锁。指令在预加载阶段获取所需页锁并持有到执行结束；修复服务每次只 TryEnter 一页，
-/// 拿不到立即跳过，绝不等待。同一个线程可重入（Monitor）。
+/// 执行方共享使用页，修复方独占页。获取失败时立即返回，不等待页的持有方。
+/// 共享使用可嵌套，独占锁可由所属线程重入，两种模式不能混用。
 /// </summary>
 internal sealed class PageLockTable
 {
-    private readonly Dictionary<int, object> _gates = new();
+    private sealed class PageGate
+    {
+        public int UseCount;
+        public int ExclusiveThreadId;
+        public int ExclusiveDepth;
+    }
 
-    private object GetGate(int pageIndex)
+    // This lock protects bookkeeping only. Page use and repair happen outside it.
+    private readonly Dictionary<int, PageGate> _gates = new();
+
+    public bool TryEnterUse(int pageIndex)
     {
         lock (_gates)
         {
-            if (!_gates.TryGetValue(pageIndex, out var gate))
-            {
-                gate = new object();
-                _gates[pageIndex] = gate;
-            }
+            var gate = GetOrCreateGate(pageIndex);
+            if (gate.ExclusiveDepth != 0)
+                return false;
 
-            return gate;
+            gate.UseCount++;
+            return true;
+        }
+    }
+
+    public void ExitUse(int pageIndex)
+    {
+        lock (_gates)
+        {
+            if (!_gates.TryGetValue(pageIndex, out var gate) || gate.UseCount == 0)
+                throw new SynchronizationLockException();
+
+            gate.UseCount--;
         }
     }
 
     public bool TryEnter(int pageIndex)
     {
-        return Monitor.TryEnter(GetGate(pageIndex));
+        var threadId = Environment.CurrentManagedThreadId;
+        lock (_gates)
+        {
+            var gate = GetOrCreateGate(pageIndex);
+            if (gate.UseCount != 0 || (gate.ExclusiveDepth != 0 && gate.ExclusiveThreadId != threadId))
+                return false;
+
+            gate.ExclusiveThreadId = threadId;
+            gate.ExclusiveDepth++;
+            return true;
+        }
     }
 
     public void Exit(int pageIndex)
     {
-        Monitor.Exit(GetGate(pageIndex));
+        var threadId = Environment.CurrentManagedThreadId;
+        lock (_gates)
+        {
+            if (!_gates.TryGetValue(pageIndex, out var gate) || gate.ExclusiveThreadId != threadId)
+                throw new SynchronizationLockException();
+
+            if (--gate.ExclusiveDepth == 0)
+                gate.ExclusiveThreadId = 0;
+        }
+    }
+
+    private PageGate GetOrCreateGate(int pageIndex)
+    {
+        if (!_gates.TryGetValue(pageIndex, out var gate))
+        {
+            gate = new PageGate();
+            _gates.Add(pageIndex, gate);
+        }
+
+        return gate;
     }
 }
