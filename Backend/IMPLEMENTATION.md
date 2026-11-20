@@ -1,102 +1,24 @@
-﻿# LargerInventory 实现说明（v0.5 落地）
+# LargerInventory 后端实现说明（v0.7）
 
-本目录是 **v0.5.0** 深化方案的代码实现。
-设计文档：`D:\Codes\LargerInventory方案设计\泰拉瑞亚超大物品储存模组-方案深化-v0.5.0-20261022-0957.docx`。
+## 执行和保存
 
-## 本轮实现（M10–M14）
+- `InventoryStore` 接收命令，`InventorySystem.PostUpdateEverything` 在主线程推进执行与修复。页加载、游戏物品序列化与堆叠钩子都在主线程进行。主线程为脏页准备字节快照，实际保存线程在执行锁下提交快照。
+- `StoreRedoJournal` 暂存页、备份、`store.meta` 和联机事务记录。完整暂存目录改名后构成提交点，随后逐个发布文件。发布中断时先重放日志，再开放仓库访问。页和元数据均使用 v2 格式。旧测试格式不会迁移。备用 `store.meta` 可能较旧，首次推进会按页核对索引。
+- 角色仓通过实际 `Player.SavePlayer` 保存。世界仓和服务端个人仓接入世界保存，服务端也定期刷新。未完成的仓库提交会记录错误，等待重试。
 
-### M10 作用域与生命周期（已实现）
+## 指令与修复
 
-- 玩家 Store：`InventoryPlayer`，跟随玩家存档路径的 `{stem}.LI/`；`LoadData` 重建 Store 并加载快速视图，`SaveData` 执行 `FlushForSave`。
-- 世界 Store：`InventorySystem`，跟随世界存档路径的 `{stem}.LI/`；`LoadWorldData/SaveWorldData` 绑定/刷新。
-- 删除关联：`On_Main.ErasePlayer` / `On_Main.EraseWorld` 之后删除对应 `.LI` 文件夹；失败只记日志。
-- 联机客户端不创建 Store（服务器权威；客户端请求结果）。
-- 路径解析：`Main.GetPlayerPathFromName`/`Main.playerPathName`、`Main.ActiveWorldFileData.Path`/`Main.worldPathName`，同目录 + 文件 stem + `.LI`。
+- `Command.InputPayload` 和 `CommandResult.ResultPayload` 分开。Put 只有在整笔物品都能放下时才提交。空间不足时回滚本次的槽位变更并归还全部输入。Take 返回实际取出的物品，调用方负责交付。强指定操作限定在请求的槽位，不能移入异类占用的目标。失败页保留页号并移出可用物品索引。
+- 修复和命令共用执行锁与页锁。有效备份可恢复主文件。确认损坏且无可用备份时，先将文件原始字节隔离，再提交同页号的空白页和摘要。读写错误、未知版本及模组物品加载错误保留待处理。修复与暂停限单机。
+- 单机取出先合并背包堆叠，再尝试世界掉落，剩余部分可随角色保存。自动拾取接收原版拾取余量。补货按实际缺口和堆叠兼容性选择物品，目标变化时退回余量。
 
-### M11 持久化（已实现）
+## 联机
 
-- `FilePageFileStore`：每页一个 `.lipg`，Header（magic/version/pageIndex/CRC/长度）+ QuickView + Items；空槽不落盘；临时文件 + 原子替换 + `.bak`。
-- `store.meta`：页目录/每页快速视图/版本索引；加载时只读 meta（Item 页按需加载）。
-- 快速视图随页保存；加载时以 Items 重建摘要并比对快速视图。
-- 卸载模组物品：`UnloadedItem` 按 `FullName` 在 `PageSummary.UnloadedTypes`/`SlotUnloadedKeys` 聚合；ItemIO 保存/恢复，不丢弃、不清理。
-- 页保存失败保持 Dirty 且不卸载；页文件缺失且 meta 显示非空时报 `PageLoadException`，不静默清空。
-- `EnablePageEviction` 在绑定磁盘 Store 时默认开启；`FlushForSave` 在存档钩子内暂停执行线程、保存脏页与 meta。
+- 协议 v7 绑定世界 UUID 与角色 UUID。客户端与服务器需使用同版，取货回执按交付代次校验。每个世界中相同角色 UUID 的连接共享一个个人仓。最后一个连接离开后，空闲约 60 秒且没有在途工作时关闭该实例。重连时从持久状态重开。
+- 联机事务和服务端定时保存都在游戏线程准备快照，在后台提交仓库文件。仓库在提交期间返回 `PageBusy`，达到持久化点后由游戏线程完成回调。显式保存与关闭仍可同步收尾。旧页摘要默认每次推进最多校准四页，期间返回 `Preparing`，完成后开放仓库。
+- 可恢复的测试事务先保存客户端操作 ID 与序号，重连后查询待处理操作。取货由服务器安排背包发放。只有原计划被证实未应用，且服务端收到匹配会话、交付代次和回包的拒绝后，才会重新规划。发放结果不明时保持待交付。背包发放确认后再处理溢出掉落。
+- 可恢复事务的已确认结果可压缩，服务端保留每个角色的已退役序号，客户端收到退役确认后清理回执。当前 GUID-only 事务与带序号事务共用 v4 账本，GUID-only 记录按原操作 ID 去重和查询。
+- 测试命令受服务器配置控制，并调用联机事务入口验证流程。后续对外接口应允许上层事务合批提交，保留提交完成与物品交付完成的区别。Put 的物品继续由服务端事务来源提供。
+- tModLoader 分别写入背包和模组回执。跨两次保存中断时，结果不明的交付会被保留。复制同 UUID 的角色可以共享仓库，角色文件仍各自保存。
 
-### M13 并行（已实现，强指定优先）
-
-- 批次分段：强指定且只操作已有槽位的 `QuerySlot/Take/Move` 可并行；弱指定/Put/Escape 作为屏障串行段。
-- 段内按槽位冲突分组；组件数 ≥ `ParallelMinComponents` 且估算耗时 ≥ `ParallelMinCostUs` 时用 `Parallel.ForEach`（`MaxParallelism` 限制）并行执行组件。
-- 页在批次前统一加载/pin；并行后 join、同步摘要/类型聚合、解 pin、按队列顺序回调。
-- 共享页集合访问用 `_pageSetGate` 串行化；Item 槽位互斥（B1.1–B1.5）。
-- 注意：当前并行仅覆盖强指定、无分配指令；弱指定/Put 仍串行（安全优先）。
-
-### M14 联机（请求/结果层已实现，钩子尚未接远程）
-
-- `NetworkSystem`：客户端 `RequestPlayerCommand`/`RequestWorldCommand` → 服务器在对应 Store 执行 → 回 `CommandResult`；只同步结果，不同步实例/页。
-- `CommandSerializer`：原生指令请求 TagCompound 序列化；`CommandResultSerializer`：原生结果序列化。ESCAPE 不序列化，第三方自行同步。
-- 客户端无 Store；结果回调在主线程。
-- 尚未完成：权限/限流/PostAction 细化、客户端拾取/消耗钩子转远程请求（按 v0.5 发布策略，自动钩子仅 Debug 测试）、重连/序号去重。
-
-## 已验证
-
-- `dotnet build`（Debug）：0 警告 0 错误。
-- `dotnet build -c Release`：0 警告 0 错误。
-- 外部反射冒烟（不启动游戏）：
-  - PUT/QueryType；
-  - `TAKE int.MaxValue` → `PARTIAL`；
-  - `CommandResultSerializer` 往返；
-  - Store 持久化：PUT → Flush → 新建 Store → 从 `store.meta` 快速视图恢复 count；`store.meta`/`pages` 生成。
-- 受限于游戏外无法初始化 `Terraria.Main`，**页内 Item 反序列化/查询需要在游戏内验证**（ItemIO/Main 初始化依赖）。
-
-## 文件地图
-
-```text
-Backend/
-  InventoryStore.cs              储存实例；Push/PushBatch；FlushForSave；meta 快速视图加载
-  StoreConfig.cs                 运行参数
-  Log.cs                         tML Mod.Logger 封装
-  Storage/
-    ItemPage.cs / PageSummary.cs / PageDirectory.cs / PageCache.cs / TypeIndex.cs
-    PageFileStore.cs             页文件格式 + FilePageFileStore + Null + CRC
-    StoreMeta.cs                 store.meta（页目录/快速视图）
-    StoreScope.cs                StoreScope + StoreLocator（玩家/世界 .LI 路径）
-  Commands/
-    Command.cs / CommandQueue.cs / CommandExecutor.cs
-    CommandSerializer.cs         原生指令请求序列化
-    CommandResultSerializer.cs   原生结果序列化
-  Integration/
-    InventoryPlayer.cs           玩家 Store（跟随玩家存档）
-    InventorySystem.cs           世界 Store、主线程队列、Erase On_ 钩子
-    InventoryGlobalItem.cs       异步拾取/消耗（仅 DEBUG 测试钩子）
-    InventoryDebugCommand.cs     /li 调试命令（仅 DEBUG）
-  Network/
-    NetworkSystem.cs             客户端请求/服务器结果（玩家/世界 Store）
-  LegacyReference.md / Legacy/   旧实现参考与存档（不参与编译）
-```
-
-## 调试（仅 Debug 构建）
-
-```text
-/li fill <type> <count>
-/li take <type> <count>
-/li q <type>
-/li slot <slotId>
-/li move <srcSlot> <dstSlot>
-/li stats
-/li netq <type>          （仅 MP 客户端；服务器执行并回结果）
-/li netfill <type> <count> （仅 MP 客户端）
-```
-
-## 责任边界（发布说明/兼容性测试必须复述）
-
-> 本模组会在非主线程调用 Item / ItemLoader / GlobalItem 钩子（包括 `CanStack`、`OnStack` 等）。
-> 第三方 mod 必须自行保证这些钩子的线程安全。该声明是责任边界，不是行为兜底。
-
-## 下一步（验证与收尾）
-
-1. 游戏内验证：玩家/世界 `.LI` 文件夹生成、重启后数据恢复、删除玩家/世界关联删除、页卸载/重载。
-2. 游戏内验证异步拾取失败补发、消耗补货、并行段与回调顺序。
-3. M14 收尾：服务器权限/限流、PostAction、客户端远程拾取/消耗（若上层需要）、序号去重。
-4. 页文件损坏/`.bak` 恢复/版本升级策略的实测。
-5. UI/配方任务由上层事务层接入指令 API（后续）。
-
+自动化覆盖和游戏内检查见 [人工测试计划](<../MANUAL_TEST_PLAN.md>)。自动化使用隔离目录验证提交重放、页恢复和事务过程。实际游戏物品兼容、多人交付与物理断电后的文件系统行为需单独验证。

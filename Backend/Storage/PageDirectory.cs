@@ -4,8 +4,9 @@ using System.Collections.Generic;
 namespace LargerInventory.Backend.Storage;
 
 /// <summary>
-/// 页目录：根数组（2048）→ 页块（1024）→ ItemPage。
-/// 按需分配页块，不预分配 2^21 个页对象。
+/// 页目录：根数组（2048）→ 页块（1024）→ ItemPage，按需分配页块。
+/// 分配器只返回目录中尚不存在的页索引；已存在的页（包括从磁盘恢复的页）永远不会被再次分配，
+/// 否则会把已有物品的页当作空页覆盖。
 /// </summary>
 internal sealed class PageDirectory
 {
@@ -15,18 +16,55 @@ internal sealed class PageDirectory
 
     private readonly ItemPage[][] _blocks = new ItemPage[BlockCount][];
     private readonly List<ItemPage> _allocated = new();
-    private int _nextPageIndex;
+    private readonly HashSet<int> _reserved = new();
+    private int _allocationCursor;
 
     public IReadOnlyList<ItemPage> Allocated => _allocated;
 
-    public ItemPage Allocate()
+    public ItemPage Allocate() => TryAllocate() ??
+        throw new InvalidOperationException("Page capacity exhausted (int SlotId limit reached).");
+
+    internal ItemPage TryAllocate()
     {
-        if (_nextPageIndex >= MaxPageCount)
+        for (var attempts = 0; attempts < MaxPageCount; attempts++)
         {
-            throw new InvalidOperationException("Page capacity exhausted (int SlotId limit reached).");
+            if (_allocationCursor >= MaxPageCount)
+            {
+                _allocationCursor = 0;
+            }
+
+            var candidate = _allocationCursor++;
+            if (!Contains(candidate) && !_reserved.Contains(candidate))
+            {
+                return GetOrCreate(candidate);
+            }
         }
 
-        return GetOrCreate(_nextPageIndex++);
+        return null;
+    }
+
+    internal void RemoveNewPage(ItemPage page)
+    {
+        _blocks[page.PageIndex >> 10][page.PageIndex & (PagesPerBlock - 1)] = null;
+        _allocated.Remove(page);
+        _allocationCursor = Math.Min(_allocationCursor, page.PageIndex);
+    }
+
+    public bool Contains(int pageIndex)
+    {
+        return TryGet(pageIndex, out _);
+    }
+
+    /// <summary>预留一个仅存在于磁盘、尚未进入目录的页索引，避免修复期间被分配器复用。</summary>
+    public void Reserve(int pageIndex)
+    {
+        CheckIndex(pageIndex);
+        _reserved.Add(pageIndex);
+    }
+
+    public void Unreserve(int pageIndex)
+    {
+        _reserved.Remove(pageIndex);
     }
 
     public ItemPage GetOrCreate(int pageIndex)

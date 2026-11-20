@@ -23,23 +23,24 @@ public static class CommandSerializer
             ["version"] = 1,
             ["kind"] = (byte)command.Kind,
             ["timeout"] = command.TimeoutMs,
-            ["strong"] = command.Access.IsStrong,
+            // NBT 不支持 bool：统一用 byte 0/1。
+            ["strong"] = (byte)(command.Access.IsStrong ? 1 : 0),
             ["slots"] = command.Access.Slots ?? Array.Empty<int>(),
             ["weakType"] = command.Access.Weak.Type,
             ["weakCount"] = command.Access.Weak.Count,
-            ["weakAvoid"] = command.Access.Weak.AvoidFavorited
+            ["weakAvoid"] = (byte)(command.Access.Weak.AvoidFavorited ? 1 : 0)
         };
 
-        switch (command.Payload)
+        switch (command.InputPayload)
         {
             case TakePayload take:
                 tag["takeType"] = take.Type;
                 tag["takeCount"] = take.Count;
-                tag["takeAvoid"] = take.AvoidFavorited;
+                tag["takeAvoid"] = (byte)(take.AvoidFavorited ? 1 : 0);
                 break;
             case PutPayload put:
                 tag["putItems"] = put.Items is List<Item> list ? list : new List<Item>(put.Items ?? Array.Empty<Item>());
-                tag["putSpill"] = put.Spill;
+                tag["putSpill"] = (byte)(put.Spill ? 1 : 0);
                 break;
             case MovePayload move:
                 tag["moveSource"] = move.SourceSlot;
@@ -65,14 +66,14 @@ public static class CommandSerializer
 
         var kind = (CommandKind)tag.Get<byte>("kind");
         var timeout = tag.Get<int>("timeout");
-        var strong = tag.Get<bool>("strong");
+        var strong = tag.Get<byte>("strong") != 0;
         var slots = tag.Get<int[]>("slots") ?? Array.Empty<int>();
         var access = strong
             ? AccessSet.Strong(slots)
             : AccessSet.ForWeak(new TypeSelector(
                 tag.Get<int>("weakType"),
                 tag.Get<int>("weakCount"),
-                tag.Get<bool>("weakAvoid")));
+                tag.Get<byte>("weakAvoid") != 0));
 
         object payload = kind switch
         {
@@ -80,12 +81,12 @@ public static class CommandSerializer
             {
                 Type = tag.Get<int>("takeType"),
                 Count = tag.Get<int>("takeCount"),
-                AvoidFavorited = tag.Get<bool>("takeAvoid")
+                AvoidFavorited = tag.Get<byte>("takeAvoid") != 0
             },
             CommandKind.Put => new PutPayload
             {
                 Items = tag.Get<List<Item>>("putItems") ?? new List<Item>(),
-                Spill = tag.Get<bool>("putSpill")
+                Spill = tag.Get<byte>("putSpill") != 0
             },
             CommandKind.Move => new MovePayload
             {

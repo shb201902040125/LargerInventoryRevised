@@ -9,12 +9,16 @@
 	  <RootNamespace>LargerInventory</RootNamespace>
 	</PropertyGroup>
 
-	<!-- 旧实现存档：只保留源码供参考，不参与编译 -->
+	<!-- 独立测试工程不参与模组编译 -->
 	<ItemGroup>
-	  <Compile Remove="Backend\Legacy\**\*.cs" />
-	  <EmbeddedResource Remove="Backend\Legacy\**" />
-	  <AdditionalFiles Remove="Backend\Legacy\**" />
-	  <None Remove="Backend\Legacy\**" />
+	  <Compile Remove="tests\**" />
+	  <EmbeddedResource Remove="tests\**" />
+	  <None Remove="tests\**" />
+	</ItemGroup>
+
+	<!-- 文档和调用示例仅供参考，不参与编译。tModLoader 打包另由 buildIgnore 排除 docs。 -->
+	<ItemGroup>
+	  <Compile Remove="docs\**\*.cs" />
 	</ItemGroup>
 
 	<!-- References -->

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using Terraria;
 
@@ -21,7 +22,17 @@ public enum CommandStatus
     PageSaveFailed = 1 << 8,
     Saturated = 1 << 9,
     EscapeError = 1 << 10,
-    InternalError = 1 << 11
+    InternalError = 1 << 11,
+
+    // 以下状态由接入层/网络层/页锁产生
+    Throttled = 1 << 12,
+    Cancelled = 1 << 13,
+    RequestTimeout = 1 << 14,
+    PageBusy = 1 << 15,
+    ManualInterrupt = 1 << 16,
+    Preparing = 1 << 17,
+    PendingDelivery = 1 << 18,
+    Retired = 1 << 19
 
     // TIMEOUT 不属于执行器状态：接入层自行等待时由接入层定义。
 }
@@ -29,12 +40,14 @@ public enum CommandStatus
 public readonly struct CommandResult
 {
     public readonly CommandStatus Status;
-    public readonly object Payload;
+
+    /// <summary>指令返回的数据，例如 Take 取出的物品。</summary>
+    public readonly object ResultPayload;
 
     public CommandResult(CommandStatus status, object payload = null)
     {
         Status = status;
-        Payload = payload;
+        ResultPayload = payload;
     }
 
     public bool IsOk => Status == CommandStatus.Ok;
@@ -47,6 +60,18 @@ public readonly struct CommandResult
     public static CommandResult Fail(CommandStatus status, object payload = null)
     {
         return new CommandResult(status, payload);
+    }
+
+    public bool TryGetResultPayload<T>(out T result)
+    {
+        if (ResultPayload is T typed)
+        {
+            result = typed;
+            return true;
+        }
+
+        result = default;
+        return false;
     }
 }
 
@@ -77,7 +102,7 @@ public sealed class AccessSet
 
     public static AccessSet Strong(params int[] slots)
     {
-        return new AccessSet(true, slots ?? Array.Empty<int>(), default);
+        return new AccessSet(true, slots is null ? Array.Empty<int>() : (int[])slots.Clone(), default);
     }
 
     public static AccessSet ForWeak(TypeSelector selector)
@@ -105,6 +130,7 @@ public sealed class TakePayload
     public int Type;
     public int Count;
     public bool AvoidFavorited = true;
+    public Item DestinationSnapshot;
 }
 
 public sealed class PutPayload
@@ -159,13 +185,15 @@ public sealed class SlotInfo
 public sealed class Command
 {
     private static long _nextId;
+    private int _submitted;
 
     public readonly long Id;
     public readonly CommandKind Kind;
     private int _timeoutMs;
     public readonly long SubmittedMs;
     public readonly AccessSet Access;
-    public readonly object Payload;
+    /// <summary>指令输入参数；Take 指令这里是 TakePayload，不是返回的物品列表。</summary>
+    public readonly object InputPayload;
     public readonly Action<CommandResult> Callback;
 
     public int TimeoutMs => _timeoutMs;
@@ -183,12 +211,14 @@ public sealed class Command
         _timeoutMs = Math.Max(0, timeoutMs);
         SubmittedMs = Environment.TickCount64;
         Access = access ?? AccessSet.ForWeak(default);
-        Payload = payload;
+        InputPayload = payload;
         Callback = callback;
     }
 
     /// <summary>边界指令（timeout=0）的截止时间为“立即”，用 long.MinValue 表示。</summary>
     public long Deadline => TimeoutMs == 0 ? long.MinValue : SubmittedMs + TimeoutMs;
+
+    internal bool TryMarkSubmitted() => Interlocked.Exchange(ref _submitted, 1) == 0;
 
     internal void Complete(CommandResult result)
     {
@@ -199,6 +229,19 @@ public sealed class Command
     public static Command CreateBoundary()
     {
         return new Command(CommandKind.NopBoundary, 0, AccessSet.ForWeak(default));
+    }
+
+    /// <summary>
+    /// 指令未被执行即失败时的结果。Put 会把全部物品作为未接收部分返回，调用方据此补偿，避免物品丢失。
+    /// </summary>
+    internal static CommandResult FailUnexecuted(Command command, CommandStatus status)
+    {
+        if (command.Kind == CommandKind.Put)
+        {
+            return CommandResult.Fail(status, ((command.InputPayload as PutPayload)?.Items ?? Array.Empty<Item>()).Distinct<Item>(ReferenceEqualityComparer.Instance).ToList());
+        }
+
+        return command.Kind == CommandKind.Take ? CommandResult.Fail(status, new List<Item>()) : CommandResult.Fail(status);
     }
 }
 
@@ -219,7 +262,7 @@ public static class CommandFactory
     public static Command QuerySlot(int[] slots, Action<CommandResult> callback = null)
     {
         return new Command(CommandKind.QuerySlot, 0, AccessSet.Strong(slots),
-            new QuerySlotPayload { Slots = slots }, callback);
+            new QuerySlotPayload { Slots = slots is null ? null : (int[])slots.Clone() }, callback);
     }
 
     public static Command Take(int type, int count, bool avoidFavorited = true, int timeoutMs = 0,
@@ -228,6 +271,17 @@ public static class CommandFactory
         return new Command(CommandKind.Take, timeoutMs,
             AccessSet.ForWeak(new TypeSelector(type, count, avoidFavorited)),
             new TakePayload { Type = type, Count = count, AvoidFavorited = avoidFavorited }, callback);
+    }
+
+    /// <summary>取出与补货目标快照兼容的物品。调用方提交后不得修改该快照。</summary>
+    public static Command TakeCompatible(Item destinationSnapshot, int count, bool avoidFavorited = true,
+        int timeoutMs = 0, Action<CommandResult> callback = null)
+    {
+        var type = destinationSnapshot?.type ?? 0;
+        return new Command(CommandKind.Take, timeoutMs,
+            AccessSet.ForWeak(new TypeSelector(type, count, avoidFavorited)),
+            new TakePayload { Type = type, Count = count, AvoidFavorited = avoidFavorited,
+                DestinationSnapshot = destinationSnapshot }, callback);
     }
 
     public static Command Put(IList<Item> items, bool spill = true, int timeoutMs = 0,
@@ -262,5 +316,3 @@ public static class CommandFactory
             new EscapePayload { Callback = action }, callback);
     }
 }
-
-

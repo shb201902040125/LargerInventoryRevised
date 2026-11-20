@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using Terraria;
 using Terraria.ModLoader.Default;
@@ -8,8 +8,10 @@ namespace LargerInventory.Backend.Storage;
 /// <summary>页内某类型的摘要统计。Count/Favorites 均为 int，饱和在 int.MaxValue。</summary>
 internal struct TypeStat
 {
-    public int Count;
-    public int Favorites;
+    public long ExactCount;
+    public long ExactFavorites;
+    public int Count { get => (int)Math.Min(ExactCount, int.MaxValue); set => ExactCount = value; }
+    public int Favorites { get => (int)Math.Min(ExactFavorites, int.MaxValue); set => ExactFavorites = value; }
 
     public static int SatAdd(int a, int b)
     {
@@ -45,6 +47,9 @@ internal sealed class PageSummary
     public int OccupiedStacks;
     public int Version;
 
+    /// <summary>该页上次加载失败（文件缺失/损坏）。摘要为最后已知值，页索引不得被重新分配。</summary>
+    public bool Unavailable;
+
     public int FreeSlots => SlotCount - OccupiedStacks;
 
     public PageSummary()
@@ -77,10 +82,10 @@ internal sealed class PageSummary
                 SlotTypes[i] = -1;
                 SlotUnloadedKeys[i] = key;
                 UnloadedTypes.TryGetValue(key, out var unloadedStat);
-                unloadedStat.Count = TypeStat.SatAdd(unloadedStat.Count, item.stack);
+                unloadedStat.ExactCount += item.stack;
                 if (item.favorited)
                 {
-                    unloadedStat.Favorites = TypeStat.SatAdd(unloadedStat.Favorites, 1);
+                    unloadedStat.ExactFavorites++;
                 }
 
                 UnloadedTypes[key] = unloadedStat;
@@ -89,10 +94,10 @@ internal sealed class PageSummary
 
             SlotTypes[i] = item.type;
             Types.TryGetValue(item.type, out var stat);
-            stat.Count = TypeStat.SatAdd(stat.Count, item.stack);
+            stat.ExactCount += item.stack;
             if (item.favorited)
             {
-                stat.Favorites = TypeStat.SatAdd(stat.Favorites, 1);
+                stat.ExactFavorites++;
             }
 
             Types[item.type] = stat;
@@ -133,5 +138,6 @@ internal sealed class PageSummary
 
         OccupiedStacks = other.OccupiedStacks;
         Version = other.Version;
+        Unavailable = other.Unavailable;
     }
 }

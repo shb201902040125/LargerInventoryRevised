@@ -1,187 +1,153 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
-using LargerInventory.Backend;
 using LargerInventory.Backend.Commands;
-using Microsoft.Xna.Framework;
 using Terraria;
 using Terraria.ID;
 using Terraria.ModLoader;
 
 namespace LargerInventory.Backend.Integration;
 
-internal static class IntegrationPolicy
-{
-#if DEBUG
-    public const bool AutoHooksEnabled = true;
-#else
-    // 发布版不向玩家提供"等效扩展背包"行为；由上层事务层通过指令 API 自行实现。
-    public const bool AutoHooksEnabled = false;
-#endif
-}
-
-/// <summary>
-/// 接入层钩子：异步指令 + 回调后处理。没有热等、没有结果超时。
-/// 指令完成只通过 Callback；游戏对象操作统一投递到主线程队列。
-/// </summary>
 public sealed class InventoryGlobalItem : GlobalItem
 {
-    public override bool OnPickup(WorldItem item, Player player)
+    private static readonly HashSet<Item> QueuedRefills = new(ReferenceEqualityComparer.Instance);
+
+    public override void Load() => On_Player.PickupItem += PickupOverflow;
+
+    public override void Unload()
     {
-        if (!IntegrationPolicy.AutoHooksEnabled || Main.netMode != NetmodeID.SinglePlayer)
+        On_Player.PickupItem -= PickupOverflow;
+        Clear();
+    }
+
+    internal static void Clear() => QueuedRefills.Clear();
+
+    private static InventoryStore GetPickupStore(Item item, Player player)
+    {
+        if (Main.netMode != NetmodeID.SinglePlayer || player is null || !player.active || player.dead ||
+            item is null || item.IsAir || InventorySystem.CommandsPaused ||
+            PlayerItemDelivery.IsProtectedDrop(item) ||
+            ModContent.GetInstance<LargerInventoryConfig>()?.AutoPickup != true)
         {
-            return true;
+            return null;
         }
 
-        var store = player?.GetModPlayer<InventoryPlayer>()?.Store;
-        if (store is null)
+        return player.GetModPlayer<InventoryPlayer>()?.Store;
+    }
+
+    // Let the vanilla pickup path run even when there is no space. The detour below sees
+    // only the remainder returned by vanilla, after all pickup hooks have accepted it.
+    public override bool ItemSpace(Item item, Player player) => GetPickupStore(item, player) is not null;
+
+    private static Item PickupOverflow(On_Player.orig_PickupItem orig, Player player, int playerIndex, int worldSlot, Item item)
+    {
+        var eligible = GetPickupStore(item, player);
+        var remainder = orig(player, playerIndex, worldSlot, item);
+        if (eligible is null || GetPickupStore(remainder, player) != eligible ||
+            worldSlot < 0 || worldSlot >= Main.item.Length || !ReferenceEquals(Main.item[worldSlot], remainder))
         {
-            return true;
+            return remainder;
         }
 
-        var inner = item.inner;
-        if (inner is null || inner.IsAir || inner.stack <= 0)
+        var empty = new Item();
+        var position = remainder.Center;
+        var command = CommandFactory.Put(new List<Item> { remainder }, true, 0, result =>
         {
-            return true;
-        }
-
-        // 玩家背包还能收下时，不抢原版行为。
-        try
-        {
-            if (ItemLoader.ItemSpace(inner, player))
+            if (result.ResultPayload is List<Item> leftovers && leftovers.Count > 0)
             {
-                return true;
+                PlayerItemDelivery.CompensatePickup(player, position, leftovers);
             }
-        }
-        catch (Exception e)
-        {
-            Log.Error("ItemSpace hook failed; fall back to vanilla pickup.", e);
-            return true;
-        }
-
-        var copy = inner.Clone();
-        var position = item.position;
-
-        try
-        {
-            item.TurnToAirAndSync();
-        }
-        catch (Exception e)
-        {
-            Log.Error("Failed to remove world item; fall back to vanilla pickup.", e);
-            return true;
-        }
-
-        try
-        {
-            store.Push(CommandFactory.Put(new List<Item> { copy }, true, 0,
-                result => OnPickupPutCompleted(result, position, player)));
-        }
-        catch (Exception e)
-        {
-            Log.Error("Failed to push pickup Put command; respawning item.", e);
-            InventorySystem.EnqueueMainThreadAction(() => RespawnItem(player, position, copy));
-        }
-
-        // 不等待结果：物品已先从世界移除，成功即入库，失败由回调补发。
-        return false;
+        });
+        Main.item[worldSlot] = empty;
+        eligible.Push(command);
+        return empty;
     }
 
-    public override bool ConsumeItem(Item item, Player player)
+    public override void OnConsumeItem(Item item, Player player)
     {
-        if (!IntegrationPolicy.AutoHooksEnabled || Main.netMode != NetmodeID.SinglePlayer)
-        {
-            return true;
-        }
-
-        var store = player?.GetModPlayer<InventoryPlayer>()?.Store;
-        if (store is null || item is null || item.IsAir)
-        {
-            return true;
-        }
-
-        var missing = item.maxStack - item.stack;
-        if (missing <= 0)
-        {
-            return true;
-        }
-
-        try
-        {
-            store.Push(CommandFactory.Take(item.type, missing, true, 0,
-                result => OnConsumeTakeCompleted(result, player)));
-        }
-        catch (Exception e)
-        {
-            Log.Error("Failed to push consume Take command.", e);
-        }
-
-        // 原版消耗照常进行；补货异步完成。
-        return true;
-    }
-
-    private static void OnPickupPutCompleted(CommandResult result, Vector2 position, Player player)
-    {
-        if (result.Payload is List<Item> remaining && remaining.Count > 0)
-        {
-            InventorySystem.EnqueueMainThreadAction(() =>
-            {
-                foreach (var item in remaining)
-                {
-                    if (item is not null && !item.IsAir && item.stack > 0)
-                    {
-                        RespawnItem(player, position, item);
-                    }
-                }
-            });
-            return;
-        }
-
-        if (!result.IsOk)
-        {
-            // 没有 remaining payload 的失败（例如 INTERNAL_ERROR）无法还原具体物品；
-            // 接入层只记录，避免盲目复制。
-            Log.Error($"Pickup Put failed without remaining payload: {result.Status}");
-        }
-    }
-
-    private static void OnConsumeTakeCompleted(CommandResult result, Player player)
-    {
-        if (result.Payload is not List<Item> taken || taken.Count == 0)
+        if (Main.netMode != NetmodeID.SinglePlayer || player is null || player.dead ||
+            item is null || item.IsAir || item.maxStack <= 1 ||
+            ModContent.GetInstance<LargerInventoryConfig>()?.AutoRefill != true ||
+            !Array.Exists(player.inventory, slot => ReferenceEquals(slot, item)) ||
+            !QueuedRefills.Add(item))
         {
             return;
         }
 
-        InventorySystem.EnqueueMainThreadAction(() =>
+        Item snapshot;
+        try
         {
-            if (player is null || !player.active)
+            snapshot = item.Clone();
+        }
+        catch (Exception error)
+        {
+            QueuedRefills.Remove(item);
+            Log.Error("Unable to snapshot the consumed item for refill.", error);
+            return;
+        }
+
+        var slotId = Array.IndexOf(player.inventory, item);
+        InventorySystem.EnqueueMainThreadAction(() => QueueRefill(player, slotId, item, snapshot));
+    }
+
+    private static void QueueRefill(Player player, int slotId, Item original, Item snapshot)
+    {
+        var store = player.GetModPlayer<InventoryPlayer>()?.Store;
+        if (store is null || !TryGetRefillTarget(player, slotId, original, snapshot, out _, out var gap))
+        {
+            QueuedRefills.Remove(original);
+            return;
+        }
+
+        store.Push(CommandFactory.TakeCompatible(snapshot, gap, true, 0, result =>
+        {
+            QueuedRefills.Remove(original);
+            if (result.ResultPayload is not List<Item> taken || taken.Count == 0)
             {
                 return;
             }
 
-            foreach (var item in taken)
+            if (TryGetRefillTarget(player, slotId, original, snapshot, out _, out _))
             {
-                if (item is not null && !item.IsAir && item.stack > 0)
-                {
-                    player.QuickSpawnItem(null, item);
-                }
+                PlayerItemDelivery.Refill(player, slotId, taken);
             }
-        });
+
+            // The target may have changed while the request was queued or a stacking hook ran.
+            // Return the exact remainder to the warehouse or retain it for the original player.
+            if (taken.Count > 0)
+            {
+                store.Push(CommandFactory.Put(taken, true, 0, put =>
+                {
+                    if (put.ResultPayload is List<Item> remaining)
+                    {
+                        PlayerItemDelivery.Hold(player, remaining);
+                    }
+                }));
+            }
+        }));
     }
 
-    private static void RespawnItem(Player player, Vector2 position, Item item)
+    private static bool TryGetRefillTarget(Player player, int slotId, Item original, Item snapshot, out Item target, out int gap)
     {
-        if (item is null || item.IsAir || item.stack <= 0)
+        target = null;
+        gap = 0;
+        if (!player.active || player.dead || (uint)slotId >= (uint)player.inventory.Length)
         {
-            return;
+            return false;
         }
 
-        if (player is not null && player.active)
+        var slot = player.inventory[slotId];
+        if (slot is null || !ReferenceEquals(slot, original) && !slot.IsAir)
         {
-            player.QuickSpawnItem(null, item);
-            return;
+            return false;
         }
 
-        Item.NewItem(null, position, item);
+        if (!slot.IsAir && (slot.type != snapshot.type || slot.prefix != snapshot.prefix))
+        {
+            return false;
+        }
+
+        target = slot;
+        gap = slot.IsAir ? snapshot.maxStack : slot.maxStack - slot.stack;
+        return gap > 0;
     }
 }
-

@@ -1,8 +1,8 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
-using System.Threading.Tasks;
+using Stopwatch = System.Diagnostics.Stopwatch;
 using LargerInventory.Backend.Storage;
 using Terraria;
 using Terraria.ModLoader;
@@ -10,20 +10,22 @@ using Terraria.ModLoader;
 namespace LargerInventory.Backend.Commands;
 
 /// <summary>
-/// 指令执行器：一条专用线程。批次到达即执行；页加载 → 指令执行 →
-/// 批次末统一同步摘要 → 解 pin → 回调（执行线程）。
-/// 当前以串行为主；并行阈值字段保留，待基准校准后启用。
+/// 指令执行器（无后台线程）。所有 Item、ItemLoader、ItemIO 及模组 Hook 调用都发生在调用
+/// <see cref="Pump"/> / <see cref="Drain"/> 的线程上，即 Terraria 主线程；指令回调也在同一线程执行。
+/// 执行与存档共用 <see cref="_executeGate"/>，保证存档不会与执行交错。
 /// </summary>
-internal sealed class CommandExecutor : IDisposable
+internal sealed class CommandExecutor
 {
+    private const int MaxDrainBatches = 1024;
+
     private readonly InventoryStore _store;
     private readonly CommandQueue _queue;
-    private Thread _thread;
-    private volatile bool _running;
-    private readonly ManualResetEventSlim _paused = new(false);
-    private readonly ManualResetEventSlim _resume = new(false);
-    private volatile bool _pauseRequested;
-    private readonly object _pageSetGate = new();
+    private readonly object _executeGate = new();
+    private volatile int _executingThreadId;
+    private HashSet<int> _activeLocks;
+    private bool _pageBusyHit;
+    private bool _pageLoadFailedHit;
+    private long _pageWork;
 
     public CommandExecutor(InventoryStore store, CommandQueue queue)
     {
@@ -31,340 +33,405 @@ internal sealed class CommandExecutor : IDisposable
         _queue = queue;
     }
 
-    public void Start()
+    /// <summary>
+    /// 在当前线程执行到期指令。若执行锁被占用（例如另一线程正在存档），本次直接跳过，不阻塞调用线程。
+    /// </summary>
+    public int Pump()
     {
-        if (_thread is not null)
+        if (_executingThreadId == Environment.CurrentManagedThreadId)
         {
-            return;
+            return 0;
         }
 
-        _running = true;
-        _thread = new Thread(Loop)
+        if (!Monitor.TryEnter(_executeGate))
         {
-            IsBackground = true,
-            Name = "LargerInventory.CommandExecutor"
-        };
-        _thread.Start();
-    }
-
-    public void Dispose()
-    {
-        _running = false;
-        _pauseRequested = false;
-        _resume.Set();
-        _queue.Signal();
-        _thread?.Join(1000);
-        _thread = null;
-    }
-
-    /// <summary>存档屏障：在批次边界暂停执行线程。调用方负责 Resume。</summary>
-    public void Pause()
-    {
-        if (_thread is null || Thread.CurrentThread == _thread)
-        {
-            // 执行线程自身（例如回调里触发存档）不能等待自己暂停。
-            return;
+            return 0;
         }
-
-        _paused.Reset();
-        _pauseRequested = true;
-        _queue.Signal();
-        _paused.Wait(5000);
-    }
-
-    public void Resume()
-    {
-        _pauseRequested = false;
-        _resume.Set();
-    }
-
-    private void Loop()
-    {
-        while (_running)
-        {
-            try
-            {
-                if (_pauseRequested)
-                {
-                    _paused.Set();
-                    _resume.Wait(1000);
-                    _resume.Reset();
-                    continue;
-                }
-
-                var now = PageCache.NowMs();
-                if (_queue.TryTakeBatch(now, _store.Config.MaxBatchCommands, out var batch))
-                {
-                    ExecuteBatch(batch);
-                    continue;
-                }
-
-                _queue.Wait(_queue.GetWaitMilliseconds(now));
-            }
-            catch (Exception e)
-            {
-                Debug.Error_Internal(e);
-                Thread.Sleep(1);
-            }
-        }
-    }
-
-    private void ExecuteBatch(List<Command> batch)
-    {
-        var affectedPages = new HashSet<int>();
-        var pinnedPages = new HashSet<int>();
 
         try
         {
-            foreach (var command in batch)
+            _executingThreadId = Environment.CurrentManagedThreadId;
+            var started = Stopwatch.GetTimestamp();
+            var timeBudgetMs = _store.Config.MaxCommandPumpMs;
+            var pageBudget = _store.Config.MaxCommandPageWorkPerPump;
+            _pageWork = 0;
+            var executed = 0;
+            for (var round = 0; round < _store.Config.MaxBatchesPerPump; round++)
             {
-                PreloadPages(command, pinnedPages);
+                // Leave untouched work in the queue. A selected batch completes with its cleanup
+                // and callbacks before yielding, and the first ready batch always gets a turn.
+                if (Integration.InventorySystem.CommandsPaused ||
+                    !_queue.TryTakeBatch(PageCache.NowMs(), _store.Config.MaxBatchCommands, out var batch))
+                {
+                    break;
+                }
+
+                ExecuteBatch(batch);
+                executed += batch.Count;
+                if (_pageWork >= pageBudget || Stopwatch.GetElapsedTime(started).TotalMilliseconds >= timeBudgetMs)
+                {
+                    break;
+                }
             }
 
-            foreach (var segment in BuildSegments(batch))
+            return executed;
+        }
+        finally
+        {
+            _executingThreadId = 0;
+            Monitor.Exit(_executeGate);
+        }
+    }
+
+    /// <summary>
+    /// 销毁前在当前线程执行全部待处理指令。仍无法完成的指令以 InternalError 明确失败，
+    /// Put 会返回全部物品，调用方可据此补偿，不会静默丢失。
+    /// </summary>
+    public void Drain()
+    {
+        if (_executingThreadId == Environment.CurrentManagedThreadId)
+        {
+            return;
+        }
+
+        if (!Monitor.TryEnter(_executeGate, _store.Config.FlushLockTimeoutMs))
+        {
+            // 存档线程正持有执行锁时，不要无限期阻塞主线程；剩余指令明确失败。
+            foreach (var pending in _queue.TakeAll())
             {
-                var segmentAffected = new HashSet<int>();
-                ExecuteSegment(segment, segmentAffected, pinnedPages);
-                _store.SyncSummaries(segmentAffected);
-                affectedPages.UnionWith(segmentAffected);
+                CompleteAndNotify(pending, Command.FailUnexecuted(pending, CommandStatus.InternalError));
+            }
+
+            return;
+        }
+
+        try
+        {
+            _executingThreadId = Environment.CurrentManagedThreadId;
+
+            var budget = MaxDrainBatches;
+            while (budget-- > 0 && _queue.Count > 0)
+            {
+                if (!_queue.TryTakeBatch(long.MaxValue, _store.Config.MaxBatchCommands, out var batch))
+                {
+                    break;
+                }
+
+                ExecuteBatch(batch);
+            }
+
+            foreach (var command in _queue.TakeAll())
+            {
+                CompleteAndNotify(command, Command.FailUnexecuted(command, CommandStatus.InternalError));
+            }
+        }
+        finally
+        {
+            _executingThreadId = 0;
+            Monitor.Exit(_executeGate);
+        }
+    }
+
+    /// <summary>
+    /// 存档屏障：在超时时间内获取执行锁。返回 false 表示执行锁被占用或发生重入，调用方必须视为存档失败。
+    /// </summary>
+    public bool TryAcquireForSave(int timeoutMs)
+    {
+        if (_executingThreadId == Environment.CurrentManagedThreadId)
+        {
+            return false;
+        }
+
+        return Monitor.TryEnter(_executeGate, timeoutMs);
+    }
+
+    public void ReleaseAfterSave()
+    {
+        Monitor.Exit(_executeGate);
+    }
+
+    /// <summary>人工暂停/销毁时清空队列，所有未执行指令明确失败（Put 返回全部物品）。</summary>
+    public void AbortQueued(CommandStatus status)
+    {
+        foreach (var command in _queue.TakeAll())
+        {
+            CompleteAndNotify(command, Command.FailUnexecuted(command, status));
+        }
+    }
+
+    internal CommandResult ExecuteTransactionCommand(Command command)
+    {
+        if (!Monitor.IsEntered(_executeGate) || _executingThreadId != 0)
+        {
+            return Command.FailUnexecuted(command, CommandStatus.PageBusy);
+        }
+
+        if (!command.TryMarkSubmitted())
+        {
+            return CommandResult.Fail(CommandStatus.Cancelled);
+        }
+
+        _executingThreadId = Environment.CurrentManagedThreadId;
+        try
+        {
+            ExecuteBatch(new List<Command> { command }, notify: false);
+            return command.Result;
+        }
+        finally
+        {
+            _executingThreadId = 0;
+        }
+    }
+
+    private void ExecuteBatch(List<Command> batch, bool notify = true)
+    {
+        var pinnedPages = new HashSet<int>();
+        var touchedPages = new HashSet<int>();
+        var index = 0;
+
+        try
+        {
+            for (; index < batch.Count; index++)
+            {
+                if (Integration.InventorySystem.CommandsPaused)
+                {
+                    for (; index < batch.Count; index++)
+                    {
+                        if (!batch[index].Done.IsSet)
+                        {
+                            batch[index].Complete(Command.FailUnexecuted(batch[index], CommandStatus.ManualInterrupt));
+                        }
+                    }
+
+                    break;
+                }
+
+                var command = batch[index];
+                if (!Validate(command, out var validationResult))
+                {
+                    command.Complete(validationResult);
+                    continue;
+                }
+
+                var locks = new HashSet<int>();
+                if (!TryLockCommandPages(command, locks))
+                {
+                    // 修复服务正在独占该页：本次指令不执行，按 PageBusy 失败。
+                    command.Complete(Command.FailUnexecuted(command, CommandStatus.PageBusy));
+                    continue;
+                }
+
+                _activeLocks = locks;
+                _pageBusyHit = false;
+                _pageLoadFailedHit = false;
+                try
+                {
+                    ExecuteCommandSafe(command, touchedPages, pinnedPages);
+                    _store.SyncSummaries(touchedPages);
+                    touchedPages.Clear();
+                }
+                finally
+                {
+                    _activeLocks = null;
+                    foreach (var pageIndex in locks)
+                    {
+                        _store.PageLocks.Exit(pageIndex);
+                    }
+                }
             }
         }
         catch (Exception e)
         {
             Debug.Error_Internal(e);
-            foreach (var command in batch)
+            for (var i = index; i < batch.Count; i++)
             {
-                if (!command.Done.IsSet)
+                if (!batch[i].Done.IsSet)
                 {
-                    command.Complete(CommandResult.Fail(CommandStatus.InternalError));
+                    batch[i].Complete(Command.FailUnexecuted(batch[i], CommandStatus.InternalError));
                 }
             }
         }
         finally
         {
-            _store.SyncSummaries(affectedPages);
+            _store.SyncSummaries(touchedPages);
             _store.PageCache.UnpinAll();
+            _store.CaptureDirtyPageSnapshots();
         }
+
+        if (!notify) return;
 
         foreach (var command in batch)
         {
-            try
-            {
-                command.Callback?.Invoke(command.Result);
-            }
-            catch (Exception e)
-            {
-                Debug.Error_Internal(e);
-            }
+            NotifyCallback(command);
         }
     }
 
-    /// <summary>
-    /// 批次分段：只有"强指定且只操作已有槽位"的指令可进入并行段；
-    /// 弱指定/Put/Escape 等作为屏障单独成段，保证其能看到前面所有效果（B1.1）。
-    /// </summary>
-    private static List<List<Command>> BuildSegments(List<Command> batch)
+    /// <summary>按页索引升序获取该指令需要的所有页锁；任一失败则释放并返回 false。</summary>
+    private bool TryLockCommandPages(Command command, HashSet<int> locks)
     {
-        var segments = new List<List<Command>>();
-        var runnable = new List<Command>();
-        foreach (var command in batch)
+        var pages = new SortedSet<int>();
+        foreach (var pageIndex in EnumerateLockedPages(command))
         {
-            if (IsParallelizable(command))
+            if (pageIndex >= 0)
             {
-                runnable.Add(command);
+                pages.Add(pageIndex);
+            }
+        }
+
+        foreach (var pageIndex in pages)
+        {
+            _pageWork++;
+
+            if (!_store.PageLocks.TryEnter(pageIndex))
+            {
+                // 强指定指令必须有这些页；弱指定指令可以跳过忙碌页，继续使用其它页。
+                if (command.Access.IsStrong)
+                {
+                    foreach (var held in locks)
+                    {
+                        _store.PageLocks.Exit(held);
+                    }
+
+                    return false;
+                }
+
                 continue;
             }
 
-            if (runnable.Count > 0)
-            {
-                segments.Add(runnable);
-                runnable = new List<Command>();
-            }
-
-            segments.Add(new List<Command> { command });
+            locks.Add(pageIndex);
         }
 
-        if (runnable.Count > 0)
-        {
-            segments.Add(runnable);
-        }
-
-        return segments;
+        return true;
     }
 
-    private static bool IsParallelizable(Command command)
+    private bool Validate(Command command, out CommandResult failure)
     {
-        if (command.Access is null || !command.Access.IsStrong)
+        var access = command.Access;
+        var slots = access.Slots;
+        var valid = command.Kind switch
+        {
+            CommandKind.NopBoundary => !access.IsStrong && command.InputPayload is null,
+            CommandKind.QueryType => !access.IsStrong && command.InputPayload is QueryTypePayload query && query.Type > 0,
+            CommandKind.QuerySlot => access.IsStrong && command.InputPayload is QuerySlotPayload query &&
+                query.Slots is not null && slots.SequenceEqual(query.Slots),
+            CommandKind.Take => command.InputPayload is TakePayload take && take.Type > 0 && take.Count > 0 &&
+                (take.DestinationSnapshot is null || (!take.DestinationSnapshot.IsAir && take.DestinationSnapshot.type == take.Type)),
+            CommandKind.Put => command.InputPayload is PutPayload put && put.Items is not null &&
+                put.Items.All(item => item is not null && !item.IsAir && item.maxStack > 0) &&
+                put.Items.Distinct(ReferenceEqualityComparer.Instance).Count() == put.Items.Count,
+            CommandKind.Move => access.IsStrong && command.InputPayload is MovePayload move && slots.Length == 2 &&
+                slots.Contains(move.SourceSlot) && slots.Contains(move.DestinationSlot) && move.SourceSlot != move.DestinationSlot,
+            CommandKind.Escape => command.InputPayload is EscapePayload { Callback: not null } &&
+                (access.IsStrong || access.Weak.Type > 0),
+            _ => false
+        };
+
+        if (valid && access.IsStrong)
+        {
+            valid = slots.Length > 0 && slots.Distinct().Count() == slots.Length &&
+                slots.All(slot => slot >= 0 && PageOf(slot) < PageDirectory.MaxPageCount &&
+                    _store.PageCache.Directory.Contains(PageOf(slot)));
+        }
+
+        failure = default;
+        if (!valid)
+        {
+            failure = command.Kind == CommandKind.QuerySlot && command.InputPayload is QuerySlotPayload { Slots: not null } query
+                ? CommandResult.Fail(CommandStatus.InvalidArg, query.Slots.Select(slot => new SlotInfo { SlotId = slot, IsAir = true }).ToArray())
+                : Command.FailUnexecuted(command, CommandStatus.InvalidArg);
+        }
+        return valid;
+    }
+
+    private IEnumerable<int> EnumerateLockedPages(Command command)
+    {
+        if (command.Access.IsStrong)
+        {
+            foreach (var slot in command.Access.Slots)
+            {
+                if (slot >= 0)
+                {
+                    yield return PageOf(slot);
+                }
+            }
+
+            yield break;
+        }
+
+        foreach (var pageIndex in EnumerateRequiredPages(command))
+        {
+            yield return pageIndex;
+        }
+    }
+
+    /// <summary>执行期动态遇到的页（例如 Put spill 新页）也必须立即加锁，避免中途被修复服务锁定。</summary>
+    private bool EnsureActivePageLock(int pageIndex)
+    {
+        if (_activeLocks is null)
         {
             return false;
         }
 
-        // 只并行不会分配新页、只操作已有槽位的强指定指令。
-        return command.Kind is CommandKind.QuerySlot or CommandKind.Take or CommandKind.Move;
+        if (_activeLocks.Contains(pageIndex))
+        {
+            return true;
+        }
+
+        if (!_store.PageLocks.TryEnter(pageIndex))
+        {
+            _pageBusyHit = true;
+            return false;
+        }
+
+        _activeLocks.Add(pageIndex);
+        return true;
     }
 
-    private void ExecuteSegment(List<Command> segment, HashSet<int> affectedPages, HashSet<int> pinnedPages)
+    private static void CompleteAndNotify(Command command, CommandResult result)
     {
-        if (segment.Count == 0)
-        {
-            return;
-        }
-
-        var components = BuildConflictComponents(segment);
-        if (components.Count >= _store.Config.ParallelMinComponents &&
-            EstimateSegmentUs(segment) >= _store.Config.ParallelMinCostUs &&
-            components.Count > 1)
-        {
-            Parallel.ForEach(
-                components,
-                new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, _store.Config.MaxParallelism) },
-                component =>
-                {
-                    foreach (var command in component)
-                    {
-                        ExecuteCommandSafe(command, affectedPages, pinnedPages);
-                    }
-                });
-            return;
-        }
-
-        foreach (var command in segment)
-        {
-            ExecuteCommandSafe(command, affectedPages, pinnedPages);
-        }
+        command.Complete(result);
+        NotifyCallback(command);
     }
 
-    private void ExecuteCommandSafe(Command command, HashSet<int> affectedPages, HashSet<int> pinnedPages)
+    private static void NotifyCallback(Command command)
     {
-        CommandResult result;
         try
         {
-            result = ExecuteCommand(command, affectedPages, pinnedPages);
+            command.Callback?.Invoke(command.Result);
         }
         catch (Exception e)
         {
             Debug.Error_Internal(e);
-            result = CommandResult.Fail(CommandStatus.InternalError);
+        }
+    }
+
+    private void ExecuteCommandSafe(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages)
+    {
+        CommandResult result;
+        try
+        {
+            result = ExecuteCommand(command, touchedPages, pinnedPages);
+        }
+        catch (Exception e)
+        {
+            Debug.Error_Internal(e);
+            result = Command.FailUnexecuted(command, CommandStatus.InternalError);
         }
 
+        if (_pageBusyHit)
+        {
+            result = new CommandResult(result.Status | CommandStatus.PageBusy, result.ResultPayload);
+        }
+
+        if (_pageLoadFailedHit) result = new CommandResult(result.Status | CommandStatus.PageLoadFailed, result.ResultPayload);
         command.Complete(result);
-    }
-
-    private static List<List<Command>> BuildConflictComponents(List<Command> segment)
-    {
-        var parent = new int[segment.Count];
-        for (var i = 0; i < parent.Length; i++)
-        {
-            parent[i] = i;
-        }
-
-        int Find(int x)
-        {
-            while (parent[x] != x)
-            {
-                parent[x] = parent[parent[x]];
-                x = parent[x];
-            }
-
-            return x;
-        }
-
-        void Union(int a, int b)
-        {
-            var ra = Find(a);
-            var rb = Find(b);
-            if (ra != rb)
-            {
-                parent[rb] = ra;
-            }
-        }
-
-        for (var i = 0; i < segment.Count; i++)
-        {
-            for (var j = i + 1; j < segment.Count; j++)
-            {
-                if (SlotsOverlap(segment[i].Access.Slots, segment[j].Access.Slots))
-                {
-                    Union(i, j);
-                }
-            }
-        }
-
-        var groups = new Dictionary<int, List<Command>>();
-        for (var i = 0; i < segment.Count; i++)
-        {
-            var root = Find(i);
-            if (!groups.TryGetValue(root, out var list))
-            {
-                list = new List<Command>();
-                groups[root] = list;
-            }
-
-            list.Add(segment[i]);
-        }
-
-        var order = new Dictionary<Command, int>();
-        for (var i = 0; i < segment.Count; i++)
-        {
-            order[segment[i]] = i;
-        }
-
-        return groups.Values
-            .OrderBy(list => order[list[0]])
-            .ToList();
-    }
-
-    private static bool SlotsOverlap(int[] a, int[] b)
-    {
-        if (a is null || b is null || a.Length == 0 || b.Length == 0)
-        {
-            return false;
-        }
-
-        foreach (var x in a)
-        {
-            foreach (var y in b)
-            {
-                if (x == y)
-                {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    private static int EstimateSegmentUs(List<Command> segment)
-    {
-        var total = 0;
-        foreach (var command in segment)
-        {
-            total += 100 + (command.Access?.Slots?.Length ?? 0) * 20;
-        }
-
-        return total;
-    }
-
-    private void PreloadPages(Command command, HashSet<int> pinnedPages)
-    {
-        foreach (var pageIndex in EnumerateRequiredPages(command))
-        {
-            if (!pinnedPages.Add(pageIndex))
-            {
-                continue;
-            }
-
-            _store.EnsurePage(pageIndex);
-            _store.PinPage(pageIndex);
-        }
     }
 
     private IEnumerable<int> EnumerateRequiredPages(Command command)
     {
         switch (command.Kind)
         {
-            case CommandKind.QuerySlot:
+            // QuerySlot 只读，按需加载即可；预加载会让一次查询对同一坏页记录两次失败日志。
             case CommandKind.Move:
             case CommandKind.Escape when command.Access.IsStrong:
                 if (command.Access.IsStrong)
@@ -397,7 +464,7 @@ internal sealed class CommandExecutor : IDisposable
                 break;
 
             case CommandKind.Put:
-                if (command.Payload is PutPayload put)
+                if (command.InputPayload is PutPayload put)
                 {
                     if (command.Access.IsStrong)
                     {
@@ -429,6 +496,7 @@ internal sealed class CommandExecutor : IDisposable
 
                         foreach (var page in _store.PageCache.AllocatedPages)
                         {
+                            _pageWork++;
                             if (page.Summary.FreeSlots > 0)
                             {
                                 yield return page.PageIndex;
@@ -443,7 +511,7 @@ internal sealed class CommandExecutor : IDisposable
 
     private static int GetTakeType(Command command)
     {
-        return command.Payload switch
+        return command.InputPayload switch
         {
             TakePayload take => take.Type,
             _ => command.Access.Weak.Type
@@ -469,52 +537,67 @@ internal sealed class CommandExecutor : IDisposable
 
         foreach (var page in _store.PageCache.AllocatedPages)
         {
-            if (page.Summary.Types.ContainsKey(type))
+            _pageWork++;
+            if (!page.LoadFailed && page.Summary.Types.ContainsKey(type))
             {
                 yield return page.PageIndex;
             }
         }
     }
 
-    private CommandResult ExecuteCommand(Command command, HashSet<int> affectedPages, HashSet<int> pinnedPages)
+    private CommandResult ExecuteCommand(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages)
     {
         return command.Kind switch
         {
             CommandKind.NopBoundary => CommandResult.Ok(),
             CommandKind.QueryType => ExecuteQueryType(command),
-            CommandKind.QuerySlot => ExecuteQuerySlot(command, affectedPages, pinnedPages),
-            CommandKind.Take => ExecuteTake(command, affectedPages, pinnedPages),
-            CommandKind.Put => ExecutePut(command, affectedPages, pinnedPages),
-            CommandKind.Move => ExecuteMove(command, affectedPages, pinnedPages),
-            CommandKind.Escape => ExecuteEscape(command, affectedPages, pinnedPages),
+            CommandKind.QuerySlot => ExecuteQuerySlot(command, touchedPages, pinnedPages),
+            CommandKind.Take => ExecuteTake(command, touchedPages, pinnedPages),
+            CommandKind.Put => ExecutePut(command, touchedPages, pinnedPages),
+            CommandKind.Move => ExecuteMove(command, touchedPages, pinnedPages),
+            CommandKind.Escape => ExecuteEscape(command, touchedPages, pinnedPages),
             _ => CommandResult.Fail(CommandStatus.InvalidArg)
         };
     }
 
     private CommandResult ExecuteQueryType(Command command)
     {
-        var payload = (QueryTypePayload)command.Payload;
+        var payload = (QueryTypePayload)command.InputPayload;
         var type = payload.Type;
         var count = 0;
         var favorites = 0;
+        var saturated = false;
         var pages = Array.Empty<int>();
 
-        if (_store.Config.EnableGlobalAggregate && _store.TypeIndex.TryGet(type, out count, out favorites, out pages))
+        if (_store.Config.EnableGlobalAggregate && _store.TypeIndex.TryGet(type, out count, out favorites, out pages, out saturated))
         {
+            _pageWork += pages.Length;
         }
         else
         {
+            long exactCount = 0;
+            long exactFavorites = 0;
             var list = new List<int>();
             foreach (var page in _store.PageCache.AllocatedPages)
             {
+                _pageWork++;
+                // 不可用页的摘要只是最后已知值，不能计入可查询/可取出的物品。
+                if (page.LoadFailed)
+                {
+                    continue;
+                }
+
                 if (page.Summary.Types.TryGetValue(type, out var stat))
                 {
-                    count = TypeStat.SatAdd(count, stat.Count);
-                    favorites = TypeStat.SatAdd(favorites, stat.Favorites);
+                    exactCount += stat.ExactCount;
+                    exactFavorites += stat.ExactFavorites;
                     list.Add(page.PageIndex);
                 }
             }
 
+            count = (int)Math.Min(exactCount, int.MaxValue);
+            favorites = (int)Math.Min(exactFavorites, int.MaxValue);
+            saturated = exactCount > int.MaxValue || exactFavorites > int.MaxValue;
             pages = list.ToArray();
         }
 
@@ -526,306 +609,309 @@ internal sealed class CommandExecutor : IDisposable
             Pages = pages
         };
 
-        // int 饱和后总量不精确：用 SATURATED 明示。
-        var status = count == int.MaxValue ? CommandStatus.Saturated : CommandStatus.Ok;
+        var status = saturated ? CommandStatus.Saturated : CommandStatus.Ok;
         return new CommandResult(status, result);
     }
 
-    private CommandResult ExecuteQuerySlot(Command command, HashSet<int> affectedPages, HashSet<int> pinnedPages)
+    private CommandResult ExecuteQuerySlot(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages)
     {
-        var payload = (QuerySlotPayload)command.Payload;
+        var payload = (QuerySlotPayload)command.InputPayload;
         if (payload.Slots is null || payload.Slots.Length == 0)
         {
             return CommandResult.Fail(CommandStatus.InvalidArg);
         }
 
-        var status = CommandStatus.Ok;
+        var found = 0;
         var result = new SlotInfo[payload.Slots.Length];
         for (var i = 0; i < payload.Slots.Length; i++)
         {
             var slotId = payload.Slots[i];
-            if (!TryGetPageForSlot(slotId, affectedPages, pinnedPages, out var page))
-            {
-                status |= CommandStatus.InvalidArg;
-                continue;
-            }
 
-            var item = page.Slots[SlotOf(slotId)];
+            // 页加载失败时保留该槽位的占位，并由结果标志报告失败。
             result[i] = new SlotInfo
             {
                 SlotId = slotId,
-                Type = item.type,
-                Stack = item.stack,
-                Favorited = item.favorited,
-                IsAir = item.IsAir
+                IsAir = true
             };
+
+            if (!TryGetPageForSlot(slotId, pinnedPages, out var page))
+            {
+                continue;
+            }
+
+            found++;
+            var item = page.Slots[SlotOf(slotId)];
+            result[i].Type = item.type;
+            result[i].Stack = item.stack;
+            result[i].Favorited = item.favorited;
+            result[i].IsAir = item.IsAir;
         }
 
-        return new CommandResult(status, result);
+        return new CommandResult(found > 0 && found < result.Length ? CommandStatus.Partial : CommandStatus.Ok, result);
     }
 
-    private CommandResult ExecuteTake(Command command, HashSet<int> affectedPages, HashSet<int> pinnedPages)
+    private CommandResult ExecuteTake(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages)
     {
-        var payload = (TakePayload)command.Payload;
-        if (payload.Count <= 0)
-        {
-            return CommandResult.Fail(CommandStatus.InvalidArg);
-        }
-
+        var payload = (TakePayload)command.InputPayload;
         var results = new List<Item>();
-        var requestAll = payload.Count == int.MaxValue;
-        var remaining = requestAll ? int.MaxValue : payload.Count;
-        var typeMismatch = false;
-        var saturated = false;
-        if (_store.Config.EnableGlobalAggregate &&
-            _store.TypeIndex.TryGet(payload.Type, out var totalBefore, out _, out _))
-        {
-            saturated = totalBefore == int.MaxValue;
-        }
-
-        foreach (var slotId in EnumerateCandidateSlots(command.Access, payload.Type))
-        {
-            if (remaining <= 0)
-            {
-                break;
-            }
-
-            if (!TryGetPageForSlot(slotId, affectedPages, pinnedPages, out var page))
-            {
-                continue;
-            }
-
-            var index = SlotOf(slotId);
-            var item = page.Slots[index];
-            if (item.IsAir)
-            {
-                continue;
-            }
-
-            if (item.type != payload.Type)
-            {
-                typeMismatch = true;
-                continue;
-            }
-
-            if (payload.AvoidFavorited && item.favorited)
-            {
-                continue;
-            }
-
-            var take = Math.Min(item.stack, remaining);
-            if (take <= 0)
-            {
-                continue;
-            }
-
-            if (take == item.stack)
-            {
-                results.Add(item);
-                page.ResetSlot(index);
-            }
-            else
-            {
-                var clone = item.Clone();
-                clone.stack = take;
-                item.stack -= take;
-                results.Add(clone);
-            }
-
-            remaining -= take;
-            MarkChanged(page, affectedPages);
-        }
-
+        var takeAll = payload.Count == int.MaxValue;
+        var remaining = payload.Count;
         var status = CommandStatus.Ok;
-        if (saturated)
+        try
         {
-            status |= CommandStatus.Saturated;
-        }
-
-        if (results.Count == 0)
-        {
-            status |= CommandStatus.NotEnough;
-            if (typeMismatch)
+            foreach (var slotId in EnumerateCandidateSlots(command.Access, payload.Type))
             {
-                status |= CommandStatus.TypeMismatch;
-            }
-        }
-        else if (remaining > 0 || requestAll)
-        {
-            // count=int.MaxValue 是"尽可能取完"哨兵：未达到哨兵即视为部分完成。
-            status |= CommandStatus.Partial;
-            if (remaining > 0 && !requestAll)
-            {
-                status |= CommandStatus.NotEnough;
-            }
-        }
-
-        return new CommandResult(status, results);
-    }
-
-    private CommandResult ExecutePut(Command command, HashSet<int> affectedPages, HashSet<int> pinnedPages)
-    {
-        var payload = (PutPayload)command.Payload;
-        if (payload.Items is null)
-        {
-            return CommandResult.Fail(CommandStatus.InvalidArg);
-        }
-
-        var remainingItems = new List<Item>();
-        foreach (var item in payload.Items.ToArray())
-        {
-            if (item is null || item.IsAir || item.stack <= 0)
-            {
-                continue;
-            }
-
-            var left = item.stack;
-
-            // 1) 合并到已有同类型堆
-            foreach (var slotId in EnumerateMergeCandidates(command.Access, item.type))
-            {
-                if (left <= 0)
+                if (!takeAll && remaining == 0)
                 {
                     break;
                 }
 
-                if (!TryGetPageForSlot(slotId, affectedPages, pinnedPages, out var page))
+                if (!TryGetPageForSlot(slotId, pinnedPages, out var page))
                 {
                     continue;
                 }
 
                 var index = SlotOf(slotId);
-                var destination = page.Slots[index];
-                if (destination.IsAir || destination.type != item.type || !ItemLoader.CanStack(destination, item))
+                var item = page.Slots[index];
+                if (item.IsAir || (payload.AvoidFavorited && item.favorited))
                 {
                     continue;
                 }
 
-                var move = Math.Min(destination.maxStack - destination.stack, left);
-                if (move <= 0)
+                if (item.type != payload.Type || (payload.DestinationSnapshot is not null &&
+                    !ItemLoader.CanStack(payload.DestinationSnapshot.Clone(), item.Clone())))
                 {
+                    if (command.Access.IsStrong) status |= CommandStatus.TypeMismatch;
                     continue;
                 }
 
-                ItemLoader.OnStack(destination, item, move);
-                destination.stack += move;
-                left -= move;
-                item.stack = left;
-                MarkChanged(page, affectedPages);
-            }
-
-            // 2) 放入空槽（或按 spill 策略新开页）
-            var placed = false;
-            if (left > 0)
-            {
-                foreach (var slotId in EnumerateEmptySlots(command.Access, payload.Spill, affectedPages, pinnedPages))
+                var count = takeAll ? item.stack : Math.Min(item.stack, remaining);
+                if (count == item.stack)
                 {
-                    if (left <= 0)
-                    {
-                        break;
-                    }
-
-                    if (!TryGetPageForSlot(slotId, affectedPages, pinnedPages, out var page))
-                    {
-                        continue;
-                    }
-
-                    var index = SlotOf(slotId);
-                    if (!page.Slots[index].IsAir)
-                    {
-                        continue;
-                    }
-
-                    if (left <= item.maxStack)
-                    {
-                        page.Slots[index] = item;
-                        item.stack = left;
-                        placed = true;
-                        MarkChanged(page, affectedPages);
-                        break;
-                    }
-
-                    var clone = item.Clone();
-                    clone.stack = item.maxStack;
-                    page.Slots[index] = clone;
-                    left -= item.maxStack;
-                    item.stack = left;
-                    MarkChanged(page, affectedPages);
+                    page.ResetSlot(index);
+                    results.Add(item);
                 }
-            }
+                else
+                {
+                    var remainder = item.Clone();
+                    var taken = Split(remainder, count);
+                    page.Slots[index] = remainder;
+                    results.Add(taken);
+                }
 
-            if (!placed && left > 0)
-            {
-                item.stack = left;
-                remainingItems.Add(item);
+                if (!takeAll) remaining -= count;
+                MarkChanged(page, touchedPages);
             }
         }
+        catch (Exception e)
+        {
+            Debug.Error_Internal(e);
+            status |= CommandStatus.InternalError;
+        }
 
-        var status = remainingItems.Count == 0
-            ? CommandStatus.Ok
-            : CommandStatus.Partial | CommandStatus.NoSpace;
-        return new CommandResult(status, remainingItems);
+        if ((!takeAll && remaining > 0) || results.Count == 0)
+        {
+            status |= CommandStatus.NotEnough;
+        }
+        if (results.Count > 0 && (status != CommandStatus.Ok || _pageBusyHit || _pageLoadFailedHit))
+        {
+            status |= CommandStatus.Partial;
+        }
+        return new CommandResult(status, results);
     }
 
-    private CommandResult ExecuteMove(Command command, HashSet<int> affectedPages, HashSet<int> pinnedPages)
+    private CommandResult ExecutePut(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages)
     {
-        var payload = (MovePayload)command.Payload;
-        if (payload.SourceSlot < 0 || payload.DestinationSlot < 0)
+        var payload = (PutPayload)command.InputPayload;
+        var inputs = payload.Items.ToArray();
+        var originalSlots = new Dictionary<(ItemPage Page, int Slot), Item>();
+        var changedPages = new HashSet<int>();
+        var newPages = new List<ItemPage>();
+        var publish = false;
+
+        void Place(ItemPage page, int slot, Item item)
         {
-            return CommandResult.Fail(CommandStatus.InvalidArg);
+            originalSlots.TryAdd((page, slot), page.Slots[slot]);
+            changedPages.Add(page.PageIndex);
+            page.Slots[slot] = item;
         }
 
-        if (!TryGetPageForSlot(payload.SourceSlot, affectedPages, pinnedPages, out var sourcePage) ||
-            !TryGetPageForSlot(payload.DestinationSlot, affectedPages, pinnedPages, out var destinationPage))
+        try
         {
-            return CommandResult.Fail(CommandStatus.InvalidArg);
+            foreach (var input in inputs)
+            {
+                var source = input;
+                var blocked = CommandStatus.Ok;
+                foreach (var slotId in EnumerateMergeCandidates(command.Access, source.type, changedPages))
+                {
+                    if (source.IsAir) break;
+                    if (!TryGetPageForSlot(slotId, pinnedPages, out var page)) continue;
+
+                    var slot = SlotOf(slotId);
+                    var destination = page.Slots[slot];
+                    if (destination.IsAir) continue;
+                    if (source.type != destination.type)
+                    {
+                        blocked |= CommandStatus.TargetOccupied | CommandStatus.TypeMismatch;
+                        continue;
+                    }
+                    if (destination.stack >= destination.maxStack)
+                    {
+                        blocked |= CommandStatus.TargetOccupied;
+                        continue;
+                    }
+                    if (!TryMerge(destination, source, out var nextDestination, out var nextSource, out _))
+                    {
+                        blocked |= CommandStatus.TargetOccupied | CommandStatus.TypeMismatch;
+                        continue;
+                    }
+
+                    Place(page, slot, nextDestination);
+                    source = nextSource;
+                }
+
+                // Avoid advancing the empty-slot iterator after a complete transfer, which could allocate a new page.
+                while (!source.IsAir)
+                {
+                    using var emptySlots = EnumerateEmptySlots(command.Access, payload.Spill, pinnedPages, newPages).GetEnumerator();
+                    var placed = false;
+                    while (!source.IsAir && emptySlots.MoveNext())
+                    {
+                        var slotId = emptySlots.Current;
+                        if (!TryGetPageForSlot(slotId, pinnedPages, out var page)) continue;
+
+                        var slot = SlotOf(slotId);
+                        if (!page.Slots[slot].IsAir) continue;
+                        if (source.stack <= source.maxStack)
+                        {
+                            Place(page, slot, source);
+                            source = null;
+                        }
+                        else
+                        {
+                            var nextSource = source.Clone();
+                            Place(page, slot, Split(nextSource, source.maxStack));
+                            source = nextSource;
+                        }
+                        placed = true;
+                        if (source is null) break;
+                    }
+                    if (source is null || !placed || command.Access.IsStrong || !payload.Spill) break;
+                }
+
+                if (source is not null && !source.IsAir)
+                {
+                    var status = CommandStatus.NoSpace;
+                    if (command.Access.IsStrong)
+                        status |= blocked;
+                    return Command.FailUnexecuted(command, status);
+                }
+            }
+
+            foreach (var pageIndex in changedPages)
+            {
+                if (_store.PageCache.Directory.TryGet(pageIndex, out var page))
+                    MarkChanged(page, touchedPages);
+            }
+            publish = true;
+            return CommandResult.Ok(new List<Item>());
+        }
+        catch (Exception e)
+        {
+            Debug.Error_Internal(e);
+            return Command.FailUnexecuted(command, CommandStatus.InternalError);
+        }
+        finally
+        {
+            if (!publish)
+            {
+                foreach (var (slot, original) in originalSlots)
+                    slot.Page.Slots[slot.Slot] = original;
+            }
+
+            foreach (var page in newPages)
+            {
+                if (publish && changedPages.Contains(page.PageIndex))
+                    continue;
+                _store.PageCache.RemoveNewPage(page);
+                pinnedPages.Remove(page.PageIndex);
+            }
+        }
+    }
+
+    private static bool TryMerge(Item destination, Item source, out Item nextDestination, out Item nextSource, out int moved)
+    {
+        nextDestination = destination.Clone();
+        nextSource = source.Clone();
+        if (!ItemLoader.TryStackItems(nextDestination, nextSource, out moved)) return false;
+        if (moved <= 0 || moved > source.stack || nextSource.stack != source.stack - moved ||
+            (long)nextDestination.stack != (long)destination.stack + moved || nextDestination.stack > nextDestination.maxStack ||
+            nextDestination.type != destination.type || (nextSource.stack > 0 && nextSource.type != source.type))
+        {
+            throw new InvalidOperationException("A stack hook changed the item type or transfer quantity.");
+        }
+        return true;
+    }
+
+    private static Item Split(Item remainder, int count)
+    {
+        var before = remainder.stack;
+        var type = remainder.type;
+        var split = ItemLoader.TransferWithLimit(remainder, count);
+        if (split.IsAir || split.type != type || split.stack != count || remainder.type != type || remainder.stack != before - count)
+        {
+            throw new InvalidOperationException("A split hook changed the item type or transfer quantity.");
+        }
+        return split;
+    }
+
+    private CommandResult ExecuteMove(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages)
+    {
+        var payload = (MovePayload)command.InputPayload;
+        if (!TryGetPageForSlot(payload.SourceSlot, pinnedPages, out var sourcePage) ||
+            !TryGetPageForSlot(payload.DestinationSlot, pinnedPages, out var destinationPage))
+        {
+            return CommandResult.Fail(_pageBusyHit ? CommandStatus.PageBusy : CommandStatus.PageLoadFailed);
         }
 
         var sourceIndex = SlotOf(payload.SourceSlot);
         var destinationIndex = SlotOf(payload.DestinationSlot);
         var source = sourcePage.Slots[sourceIndex];
-        if (source.IsAir)
-        {
-            return CommandResult.Fail(CommandStatus.NotFound);
-        }
+        if (source.IsAir) return CommandResult.Fail(CommandStatus.NotFound);
 
         var destination = destinationPage.Slots[destinationIndex];
         if (destination.IsAir)
         {
-            destinationPage.Slots[destinationIndex] = source;
             sourcePage.ResetSlot(sourceIndex);
-            MarkChanged(sourcePage, affectedPages);
-            MarkChanged(destinationPage, affectedPages);
-            return CommandResult.Ok();
+            destinationPage.Slots[destinationIndex] = source;
+            MarkChanged(sourcePage, touchedPages);
+            MarkChanged(destinationPage, touchedPages);
+            return CommandResult.Ok(source.stack);
         }
-
-        if (!ItemLoader.CanStack(destination, source))
+        if (destination.type != source.type)
+        {
+            return CommandResult.Fail(CommandStatus.TargetOccupied | CommandStatus.TypeMismatch);
+        }
+        if (destination.stack >= destination.maxStack)
+        {
+            return CommandResult.Fail(CommandStatus.TargetOccupied);
+        }
+        if (!TryMerge(destination, source, out var nextDestination, out var nextSource, out var moved))
         {
             return CommandResult.Fail(CommandStatus.TargetOccupied | CommandStatus.TypeMismatch);
         }
 
-        var move = Math.Min(destination.maxStack - destination.stack, source.stack);
-        if (move <= 0)
-        {
-            return CommandResult.Fail(CommandStatus.TargetOccupied);
-        }
-
-        ItemLoader.OnStack(destination, source, move);
-        destination.stack += move;
-        source.stack -= move;
-        if (source.stack <= 0)
-        {
-            sourcePage.ResetSlot(sourceIndex);
-        }
-
-        MarkChanged(sourcePage, affectedPages);
-        MarkChanged(destinationPage, affectedPages);
-        return CommandResult.Ok(move);
+        if (nextSource.IsAir) sourcePage.ResetSlot(sourceIndex);
+        else sourcePage.Slots[sourceIndex] = nextSource;
+        destinationPage.Slots[destinationIndex] = nextDestination;
+        MarkChanged(sourcePage, touchedPages);
+        MarkChanged(destinationPage, touchedPages);
+        return new CommandResult(nextSource.IsAir ? CommandStatus.Ok : CommandStatus.Partial | CommandStatus.TargetOccupied, moved);
     }
 
-    private CommandResult ExecuteEscape(Command command, HashSet<int> affectedPages, HashSet<int> pinnedPages)
+    private CommandResult ExecuteEscape(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages)
     {
-        var payload = (EscapePayload)command.Payload;
+        var payload = (EscapePayload)command.InputPayload;
         if (payload?.Callback is null)
         {
             return CommandResult.Fail(CommandStatus.InvalidArg);
@@ -834,7 +920,7 @@ internal sealed class CommandExecutor : IDisposable
         var items = new List<Item>();
         foreach (var slotId in EnumerateCandidateSlots(command.Access, GetTakeType(command)))
         {
-            if (!TryGetPageForSlot(slotId, affectedPages, pinnedPages, out var page))
+            if (!TryGetPageForSlot(slotId, pinnedPages, out var page))
             {
                 continue;
             }
@@ -843,7 +929,7 @@ internal sealed class CommandExecutor : IDisposable
             if (!item.IsAir)
             {
                 items.Add(item);
-                MarkChanged(page, affectedPages);
+                MarkChanged(page, touchedPages);
             }
         }
 
@@ -880,6 +966,7 @@ internal sealed class CommandExecutor : IDisposable
 
         foreach (var pageIndex in EnumeratePagesWithType(type))
         {
+            _pageWork++;
             if (!_store.PageCache.Directory.TryGet(pageIndex, out var page))
             {
                 continue;
@@ -895,39 +982,38 @@ internal sealed class CommandExecutor : IDisposable
         }
     }
 
-    private IEnumerable<int> EnumerateMergeCandidates(AccessSet access, int type)
+    private IEnumerable<int> EnumerateMergeCandidates(AccessSet access, int type, HashSet<int> touchedPages)
     {
         if (access.IsStrong)
         {
             foreach (var slot in access.Slots)
             {
-                if (slot >= 0)
-                {
-                    yield return slot;
-                }
+                yield return slot;
             }
-
             yield break;
         }
 
-        foreach (var pageIndex in EnumeratePagesWithType(type))
+        var modifiedPages = touchedPages.ToHashSet();
+        foreach (var slot in EnumerateCandidateSlots(access, type))
         {
-            if (!_store.PageCache.Directory.TryGet(pageIndex, out var page))
+            if (!modifiedPages.Contains(PageOf(slot))) yield return slot;
+        }
+        // Slots filled by earlier input items need to participate before the command's summary is rebuilt.
+        foreach (var pageIndex in modifiedPages)
+        {
+            _pageWork++;
+            if (!_store.PageCache.TryGetLoaded(pageIndex, out var page)) continue;
+            for (var index = 0; index < ItemPage.SlotCount; index++)
             {
-                continue;
-            }
-
-            for (var i = 0; i < ItemPage.SlotCount; i++)
-            {
-                if (page.Summary.SlotTypes[i] == type)
+                if (!page.Slots[index].IsAir && page.Slots[index].type == type)
                 {
-                    yield return (pageIndex << 10) | i;
+                    yield return (pageIndex << 10) | index;
                 }
             }
         }
     }
 
-    private IEnumerable<int> EnumerateEmptySlots(AccessSet access, bool spill, HashSet<int> affectedPages, HashSet<int> pinnedPages)
+    private IEnumerable<int> EnumerateEmptySlots(AccessSet access, bool spill, HashSet<int> pinnedPages, List<ItemPage> newPages)
     {
         if (access.IsStrong)
         {
@@ -938,7 +1024,7 @@ internal sealed class CommandExecutor : IDisposable
                     continue;
                 }
 
-                if (TryGetPageForSlot(slot, affectedPages, pinnedPages, out var page) && page.Slots[SlotOf(slot)].IsAir)
+                if (TryGetPageForSlot(slot, pinnedPages, out var page) && page.Slots[SlotOf(slot)].IsAir)
                 {
                     yield return slot;
                 }
@@ -949,12 +1035,13 @@ internal sealed class CommandExecutor : IDisposable
 
         foreach (var page in _store.PageCache.AllocatedPages.ToArray())
         {
-            if (page.Summary.FreeSlots <= 0)
+            _pageWork++;
+            if (page.LoadFailed || page.Summary.FreeSlots <= 0)
             {
                 continue;
             }
 
-            if (!TryGetPageForSlot((page.PageIndex << 10), affectedPages, pinnedPages, out var loaded))
+            if (!TryGetPageForSlot(page.PageIndex << 10, pinnedPages, out var loaded))
             {
                 continue;
             }
@@ -973,17 +1060,30 @@ internal sealed class CommandExecutor : IDisposable
             yield break;
         }
 
-        var newPage = _store.AllocatePage();
+        var newPage = _store.AllocatePage(allowCapacityFailure: true);
+        if (newPage is null)
+            yield break;
+
+        _pageWork++;
+        newPages.Add(newPage);
+        if (!EnsureActivePageLock(newPage.PageIndex))
+        {
+            yield break;
+        }
+
         pinnedPages.Add(newPage.PageIndex);
         _store.PinPage(newPage.PageIndex);
-        affectedPages.Add(newPage.PageIndex);
         for (var i = 0; i < ItemPage.SlotCount; i++)
         {
             yield return (newPage.PageIndex << 10) | i;
         }
     }
 
-    private bool TryGetPageForSlot(int slotId, HashSet<int> affectedPages, HashSet<int> pinnedPages, out ItemPage page)
+    /// <summary>
+    /// 获取槽位所在页。页无法加载（文件损坏、缺失等）时返回 false，调用方跳过该槽位，
+    /// 从而保证不会向不可读的页写入，也不会在命令中途抛出导致部分提交。
+    /// </summary>
+    private bool TryGetPageForSlot(int slotId, HashSet<int> pinnedPages, out ItemPage page)
     {
         page = null;
         if (slotId < 0)
@@ -997,27 +1097,42 @@ internal sealed class CommandExecutor : IDisposable
             return false;
         }
 
-        lock (_pageSetGate)
-        {
-            if (pinnedPages.Add(pageIndex))
-            {
-                _store.EnsurePage(pageIndex);
-                _store.PinPage(pageIndex);
-            }
+        // 即使最终因锁忙碌而失败，也记录“该玩家请求过此页”，供修复完成后的变更通知使用。
 
+        // 页不存在时视为非法槽位，不能为了让查询成功而分配一个空页并写入 store.meta。
+        if (!_store.PageCache.Directory.Contains(pageIndex))
+        {
+            return false;
+        }
+
+        if (!EnsureActivePageLock(pageIndex))
+        {
+            return false;
+        }
+
+        try
+        {
             page = _store.EnsurePage(pageIndex);
+        }
+        catch (PageLoadException e)
+        {
+            _pageLoadFailedHit = true;
+            Log.Error($"Page {pageIndex} unavailable; slot {slotId} skipped.", e);
+            return false;
+        }
+
+        if (pinnedPages.Add(pageIndex))
+        {
+            _pageWork++;
+            _store.PinPage(pageIndex);
         }
 
         return true;
     }
 
-    private void MarkChanged(ItemPage page, HashSet<int> affectedPages)
+    private void MarkChanged(ItemPage page, HashSet<int> touchedPages)
     {
-        lock (_pageSetGate)
-        {
-            affectedPages.Add(page.PageIndex);
-        }
-
+        touchedPages.Add(page.PageIndex);
         _store.MarkDirty(page);
     }
 
@@ -1031,6 +1146,3 @@ internal sealed class CommandExecutor : IDisposable
         return slotId & 0x3FF;
     }
 }
-
-
-

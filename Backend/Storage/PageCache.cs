@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Terraria;
@@ -13,13 +13,19 @@ internal sealed class PageCache
 {
     private readonly StoreConfig _config;
     private readonly IPageFileStore _fileStore;
+    private readonly PageLockTable _pageLocks;
     private readonly PageDirectory _directory = new();
     private readonly HashSet<int> _pinned = new();
+    private readonly HashSet<ItemPage> _dirty = new();
+    private readonly HashSet<ItemPage> _unsnapshotted = new();
+    private readonly Dictionary<int, (int Version, byte[] Bytes)> _snapshots = new();
+    private readonly HashSet<int> _backupLoads = new();
 
-    public PageCache(StoreConfig config, IPageFileStore fileStore)
+    public PageCache(StoreConfig config, IPageFileStore fileStore, PageLockTable pageLocks)
     {
         _config = config;
         _fileStore = fileStore ?? new NullPageFileStore();
+        _pageLocks = pageLocks ?? new PageLockTable();
     }
 
     public PageDirectory Directory => _directory;
@@ -29,22 +35,58 @@ internal sealed class PageCache
     public ItemPage EnsureLoaded(int pageIndex)
     {
         var page = _directory.GetOrCreate(pageIndex);
-        if (!page.Loaded)
+        if (page.Loaded)
         {
-            LoadPage(page);
+            page.LastUsedMs = NowMs();
+            return page;
         }
 
+        // 与修复服务/其它调用共享页锁；主线程指令通常已持有该锁（Monitor 可重入）。
+        if (!_pageLocks.TryEnter(pageIndex))
+        {
+            throw new PageLoadException($"page {pageIndex} is busy");
+        }
+
+        try
+        {
+            try
+            {
+                LoadPage(page);
+            }
+            catch (PageLoadException)
+            {
+                page.LoadFailed = true;
+                throw;
+            }
+
+            page.LoadFailed = false;
+            page.LastUsedMs = NowMs();
+            return page;
+        }
+        finally
+        {
+            _pageLocks.Exit(pageIndex);
+        }
+    }
+
+    public ItemPage AllocatePage(bool allowCapacityFailure = false)
+    {
+        var page = allowCapacityFailure ? _directory.TryAllocate() : _directory.Allocate();
+        if (page is null)
+            return null;
+        page.EnsureSlots();
+        page.Summary.RebuildFrom(page.Slots);
+        page.KnownNonEmpty = false;
         page.LastUsedMs = NowMs();
         return page;
     }
 
-    public ItemPage AllocatePage()
+    internal void RemoveNewPage(ItemPage page)
     {
-        var page = _directory.Allocate();
-        page.EnsureSlots();
-        page.Summary.RebuildFrom(page.Slots);
-        page.LastUsedMs = NowMs();
-        return page;
+        _pinned.Remove(page.PageIndex);
+        ClearDirty(page);
+        _backupLoads.Remove(page.PageIndex);
+        _directory.RemoveNewPage(page);
     }
 
     public bool TryGetLoaded(int pageIndex, out ItemPage page)
@@ -80,8 +122,18 @@ internal sealed class PageCache
         MaybeEvict();
     }
 
+    /// <summary>按配置上限修剪当前已加载页；用于启动时逐页重建摘要。</summary>
+    public void TrimToLimit()
+    {
+        MaybeEvict();
+    }
+
     public void MarkDirty(ItemPage page)
     {
+        _snapshots.Remove(page.PageIndex);
+        _dirty.Add(page);
+        if (_fileStore.Available)
+            _unsnapshotted.Add(page);
         page.Dirty = true;
     }
 
@@ -100,7 +152,8 @@ internal sealed class PageCache
 
             page.EnsureSlots();
             page.Summary.RebuildFrom(page.Slots);
-            page.Dirty = false;
+            page.KnownNonEmpty = false;
+            ClearDirty(page);
             return;
         }
 
@@ -112,7 +165,7 @@ internal sealed class PageCache
         var items = result.Items;
         if (items is null || items.Length != ItemPage.SlotCount)
         {
-            items = new Item[ItemPage.SlotCount];
+            throw new PageLoadException($"page {page.PageIndex} returned an invalid item array");
         }
 
         for (var i = 0; i < items.Length; i++)
@@ -121,21 +174,17 @@ internal sealed class PageCache
         }
 
         page.Slots = items;
+        page.RuntimeLoaded = true;
         page.Summary.RebuildFrom(items);
+        page.KnownNonEmpty = page.Summary.OccupiedStacks > 0;
 
-        // 快速视图随页保存；加载后用 Items 重建并比对（不一致以 Items 为准）。
-        if (result.QuickView is not null)
-        {
-            if (result.QuickView.OccupiedStacks != page.Summary.OccupiedStacks)
-            {
-                Log.Warn($"Page {page.PageIndex}: quick view occupied count mismatch; rebuilt from items.");
-            }
-
-            page.Summary.Version = Math.Max(page.Summary.Version, result.QuickView.Version);
-        }
+        if (result.FromBackup)
+            _backupLoads.Add(page.PageIndex);
+        else
+            _backupLoads.Remove(page.PageIndex);
 
         page.Summary.Version++;
-        page.Dirty = false;
+        ClearDirty(page);
     }
 
     private void MaybeEvict()
@@ -162,65 +211,72 @@ internal sealed class PageCache
                 continue;
             }
 
-            if (page.Dirty && !SavePage(page, out var error))
-            {
-                Log.Error($"Page {page.PageIndex} save before eviction failed: {error}");
+            if (page.Dirty)
                 continue;
-            }
 
             page.ReleaseSlots();
         }
     }
 
-    /// <summary>保存单页；失败时返回 false 并保持 Dirty。</summary>
-    public bool SavePage(ItemPage page, out string error)
+    /// <summary>Only the owner thread calls ItemIO. Save threads use the resulting byte arrays.</summary>
+    public void CaptureDirtySnapshots()
     {
-        error = null;
-        if (!_fileStore.Available)
-        {
-            return true;
-        }
+        if (_unsnapshotted.Count == 0)
+            return;
 
-        if (!page.Loaded)
+        // Snapshot hooks may fail. Keep those pages in the set for the next owner-thread attempt.
+        foreach (var page in _unsnapshotted.ToArray())
         {
-            return true;
+            try
+            {
+                _snapshots[page.PageIndex] = (page.Summary.Version,
+                    FilePageFileStore.Snapshot(page.PageIndex, page.Slots, page.Summary));
+                _unsnapshotted.Remove(page);
+            }
+            catch (Exception e)
+            {
+                _snapshots.Remove(page.PageIndex);
+                Log.Error($"Could not snapshot page {page.PageIndex}.", e);
+            }
         }
-
-        var result = _fileStore.Save(page.PageIndex, page.Slots, page.Summary);
-        if (!result.Success)
-        {
-            error = result.Error;
-            return false;
-        }
-
-        page.Dirty = false;
-        return true;
     }
 
-    /// <summary>存档屏障：保存所有 Dirty 页。</summary>
-    public bool SaveDirtyPages(out string error)
+    public bool HasDirtyPages => _dirty.Count != 0;
+
+    public bool WasLoadedFromBackup(int index) => _backupLoads.Contains(index);
+
+    public void ClearBackupSource(int index) => _backupLoads.Remove(index);
+
+    public (ItemPage[] Pages, FilePageFileStore.SaveSnapshot[] Files) FreezeDirtyPages()
     {
-        error = null;
-        if (!_fileStore.Available)
+        var pages = new ItemPage[_dirty.Count];
+        var files = new FilePageFileStore.SaveSnapshot[pages.Length];
+        var i = 0;
+        foreach (var page in _dirty)
         {
-            return true;
+            if (!page.Loaded || !_snapshots.TryGetValue(page.PageIndex, out var snapshot) || snapshot.Version != page.Summary.Version)
+                throw new InvalidOperationException($"Page {page.PageIndex} has no current main-thread snapshot.");
+            pages[i] = page;
+            files[i++] = new(page.PageIndex, snapshot.Bytes, _backupLoads.Contains(page.PageIndex));
         }
+        return (pages, files);
+    }
 
-        foreach (var page in _directory.Allocated)
+    public void AcknowledgeCommit(ItemPage[] pages)
+    {
+        foreach (var page in pages)
         {
-            if (!page.Loaded || !page.Dirty)
-            {
-                continue;
-            }
-
-            if (!SavePage(page, out var pageError))
-            {
-                error = $"page {page.PageIndex}: {pageError}";
-                return false;
-            }
+            ClearDirty(page);
+            _backupLoads.Remove(page.PageIndex);
         }
+    }
 
-        return true;
+    private void ClearDirty(ItemPage page)
+    {
+        page.Dirty = false;
+        _dirty.Remove(page);
+        _unsnapshotted.Remove(page);
+        _snapshots.Remove(page.PageIndex);
     }
 
     internal static long NowMs()
@@ -228,5 +284,3 @@ internal sealed class PageCache
         return Environment.TickCount64;
     }
 }
-
-

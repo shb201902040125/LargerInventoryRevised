@@ -1,5 +1,6 @@
-﻿using System.Linq;
-using LargerInventory.Backend.Storage;
+using System;
+using System.Collections.Generic;
+using LargerInventory.Backend.Network;
 using Terraria;
 using Terraria.ID;
 using Terraria.ModLoader;
@@ -7,111 +8,90 @@ using Terraria.ModLoader.IO;
 
 namespace LargerInventory.Backend.Integration;
 
-/// <summary>
-/// 玩家作用域 Store：跟随本地/服务器端玩家存档的 .LI 文件夹。
-/// 客户端多人模式不持有 Store（由服务器保存，客户端只请求结果）。
-/// </summary>
 public sealed class InventoryPlayer : ModPlayer
 {
-    public InventoryStore Store { get; private set; }
+    // Remote server slots borrow a shared store. InventorySystem owns all open stores.
+    public InventoryStore Store { get; internal set; }
+    public Guid PersistentPlayerId { get; private set; }
+    public Dictionary<string, byte[]> DeliveryReceipts { get; private set; }
 
-    private bool _inMemory;
+    public override void Initialize()
+    {
+        DeliveryReceipts = new Dictionary<string, byte[]>();
+    }
 
     public override void LoadData(TagCompound tag)
     {
-        if (Main.netMode == NetmodeID.MultiplayerClient)
-        {
-            // v0.5：联机客户端不持有实例，只向服务器请求结果。
-            return;
-        }
-
-        CreateStore();
+        PersistentPlayerId = StoreIdentity.ReadPlayerId(tag);
+        InventoryClientState.LoadPlayerReceipts(tag, DeliveryReceipts);
+        PlayerItemDelivery.LoadPending(Player, tag);
     }
 
     public override void SaveData(TagCompound tag)
     {
-        if (Main.netMode == NetmodeID.MultiplayerClient)
-        {
-            return;
-        }
-
-        if (Store is null)
-        {
-            return;
-        }
-
-        if (!Store.FlushForSave(out var error))
-        {
-            Log.Error($"Player store save failed: {error}");
-        }
+        tag[StoreIdentity.PlayerIdKey] = EnsureCharacterId().ToString("N");
+        InventoryClientState.SavePlayerReceipts(tag, DeliveryReceipts);
+        PlayerItemDelivery.SavePending(Player, tag);
     }
 
     public override void OnEnterWorld()
     {
-        if (Main.netMode == NetmodeID.MultiplayerClient)
+        if (Main.netMode == NetmodeID.Server || Player.whoAmI != Main.myPlayer)
         {
             return;
         }
 
-        if (Store is null || _inMemory)
+        var file = Main.ActivePlayerFileData;
+        try
         {
-            CreateStore();
+            if (file?.Player != Player || string.IsNullOrWhiteSpace(file.Path))
+            {
+                throw new InvalidOperationException("The selected character save has no usable path.");
+            }
+
+            if (PersistentPlayerId == Guid.Empty)
+            {
+                // Upgrade an existing character before exposing its ID to a server or marking a local store.
+                var assigned = EnsureCharacterId();
+                Player.SavePlayer(file, skipMapSave: true);
+                if (StoreIdentity.ReadSavedPlayerId(file.Path, file.IsCloudSave, Mod.Name) != assigned)
+                {
+                    throw new InvalidOperationException("The game did not persist the character UUID.");
+                }
+            }
+            else if (StoreIdentity.ReadSavedPlayerId(file.Path, file.IsCloudSave, Mod.Name) != PersistentPlayerId)
+            {
+                throw new InvalidOperationException("The character UUID does not match the selected save.");
+            }
+
+            if (Main.netMode == NetmodeID.MultiplayerClient)
+            {
+                NetworkSystem.SendHello(PersistentPlayerId);
+            }
+            else
+            {
+                InventorySystem.Instance?.OpenLocalPlayer(this, file);
+            }
+        }
+        catch (Exception e)
+        {
+            Log.Error("Could not initialize the Larger Inventory character identity.", e);
         }
     }
 
     public override void PlayerDisconnect()
     {
-        DisposeStore();
+        NetworkSystem.ForgetPlayer(Player.whoAmI);
+        InventorySystem.Instance?.UnbindServerPlayer(this);
     }
 
-    private void CreateStore()
+    private Guid EnsureCharacterId()
     {
-        DisposeStore();
-
-        var path = ResolvePlayerFilePath();
-        if (string.IsNullOrWhiteSpace(path))
+        if (PersistentPlayerId == Guid.Empty)
         {
-            Log.Warn("Player store path not resolved; using in-memory store for this session.");
-            _inMemory = true;
-            Store = new InventoryStore(new StoreConfig());
-            Store.Start();
-            return;
+            PersistentPlayerId = Guid.NewGuid();
         }
 
-        _inMemory = false;
-        var directory = StoreLocator.GetPlayerStoreDirectory(path);
-        Store = new InventoryStore(new StoreConfig(), directory, StoreScope.Player);
-        Store.Start();
-        Log.Info($"Player store opened: {directory}");
-    }
-
-    private string ResolvePlayerFilePath()
-    {
-        var path = Main.GetPlayerPathFromName(Player.name, false);
-        if (!string.IsNullOrWhiteSpace(path))
-        {
-            return path;
-        }
-
-        var data = Main.PlayerList.FirstOrDefault(fd => fd.Player == Player);
-        if (!string.IsNullOrWhiteSpace(data?.Path))
-        {
-            return data.Path;
-        }
-
-        return Main.ActivePlayerFileData?.Path;
-    }
-
-    private void DisposeStore()
-    {
-        if (Store is null)
-        {
-            return;
-        }
-
-        Store.Dispose();
-        Store = null;
+        return PersistentPlayerId;
     }
 }
-
-

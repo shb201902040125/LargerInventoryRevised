@@ -1,3 +1,5 @@
 displayName = Larger Inventory
 author = SilverMoon
-version = 0.5.0
+version = 0.7.0
+side = Both
+buildIgnore = bin/*, bin/**, obj/*, obj/**, tests/*, tests/**, docs/*, docs/**, .idea/*, .idea/**, .dsh-project-memory/*, .dsh-project-memory/**, .git/*, .git/**, *.md, Folder.DotSettings.user

@@ -1,1 +1,45 @@
+Mods: {
+	LargerInventory: {
+		Configs: {
+			LargerInventoryConfig: {
+				DisplayName: Larger Inventory
 
+				EnableTestCommands: {
+					Label: Enable test commands
+					Tooltip: Enables the /li test commands. Singleplayer repair archives damaged files before replacing the page.
+				}
+
+				AutoPickup: {
+					Label: Store pickup overflow
+					Tooltip: In singleplayer, store the items that vanilla pickup could not fit.
+				}
+
+				AutoRefill: {
+					Label: Refill consumed stacks
+					Tooltip: In singleplayer, refill consumed stacks from compatible, unfavorited items in the warehouse.
+				}
+			}
+		}
+	}
+}
+
+Configs: {
+	LargerInventoryConfig: {
+		DisplayName: Larger Inventory Config
+
+		EnableTestCommands: {
+			Label: Enable Test Commands
+			Tooltip: ""
+		}
+
+		AutoPickup: {
+			Label: Auto Pickup
+			Tooltip: ""
+		}
+
+		AutoRefill: {
+			Label: Auto Refill
+			Tooltip: ""
+		}
+	}
+}

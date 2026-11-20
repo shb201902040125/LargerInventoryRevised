@@ -1,9 +1,8 @@
-﻿#if DEBUG
 using System;
 using System.Collections.Generic;
-using System.Threading;
 using LargerInventory.Backend.Commands;
 using LargerInventory.Backend.Network;
+using LargerInventory.Backend.Storage;
 using Terraria.ID;
 using Terraria;
 using Terraria.ModLoader;
@@ -11,18 +10,25 @@ using Terraria.ModLoader;
 namespace LargerInventory.Backend.Integration;
 
 /// <summary>
-/// 仅 Debug 构建的冒烟/调试命令。发布版不注册任何玩家命令；
-/// 正式功能由上层事务层通过代码调用指令 API 实现。
+/// 测试命令。默认在 Mod Config 中关闭；只有服务器/单机配置开启时才允许使用。
+/// 修复指令具有破坏性，联机时只能由服务器修复请求者自己的玩家 Store。
 /// </summary>
 public sealed class InventoryDebugCommand : ModCommand
 {
     public override CommandType Type => CommandType.Chat;
     public override string Command => "li";
-    public override string Usage => "/li fill <type> <count> | take <type> <count> | q <type> | slot <slotId> | move <srcSlot> <dstSlot> | stats | netq <type> | netfill <type> <count>";
-    public override string Description => "LargerInventory debug command (DEBUG only).";
+    public override string Usage => "/li fill <type> <count> | take <type> <count> | q <type> | slot <slotId> | move <srcSlot> <dstSlot> | stats | repair [world|status|cancel] | pause [on|off] | netq <type> [world] | netfill <type> <count> | nettake <type> <count> | netmove <srcSlot> <dstSlot> | netresult <operation-id> | netcollect <operation-id>";
+    public override string Description => "LargerInventory test command (requires config).";
 
     public override void Action(CommandCaller caller, string input, string[] args)
     {
+        var config = ModContent.GetInstance<LargerInventoryConfig>();
+        if (config is null || !config.EnableTestCommands)
+        {
+            caller.Reply("LargerInventory test commands are disabled. Enable 'Enable test commands' in Mod Configs.", Microsoft.Xna.Framework.Color.Yellow);
+            return;
+        }
+
         if (args.Length == 0)
         {
             caller.Reply(Usage, Microsoft.Xna.Framework.Color.Yellow);
@@ -30,13 +36,32 @@ public sealed class InventoryDebugCommand : ModCommand
         }
 
         var sub = args[0].ToLowerInvariant();
-        if (sub is "netq" or "netfill")
+        Log.Info($"/li invoked: {string.Join(" ", args)}");
+        if (sub is "netq" or "netfill" or "nettake" or "netmove" or "netresult" or "netcollect")
         {
             HandleNetwork(args, sub, caller);
             return;
         }
 
-        var store = Main.LocalPlayer?.GetModPlayer<InventoryPlayer>()?.Store ?? InventorySystem.Instance?.WorldStore;
+        if (sub == "repair")
+        {
+            HandleRepair(args, caller);
+            return;
+        }
+
+        if (sub == "pause")
+        {
+            HandlePause(args, caller);
+            return;
+        }
+
+        if (Main.netMode != NetmodeID.SinglePlayer)
+        {
+            caller.Reply("Use the /li net commands in multiplayer.");
+            return;
+        }
+
+        var store = caller.Player?.GetModPlayer<InventoryPlayer>()?.Store;
         if (store is null)
         {
             caller.Reply("Store is not ready.", Microsoft.Xna.Framework.Color.Red);
@@ -54,7 +79,7 @@ public sealed class InventoryDebugCommand : ModCommand
                 }
 
                 var result = Run(store, cb => CommandFactory.QueryType(type, 0, cb));
-                if (result.Payload is QueryTypeResult view)
+                if (result.ResultPayload is QueryTypeResult view)
                 {
                     caller.Reply($"type={view.Type} count={view.Count} favorites={view.Favorites} pages={view.Pages.Length} flags={result.Status}");
                 }
@@ -74,28 +99,15 @@ public sealed class InventoryDebugCommand : ModCommand
                     return;
                 }
 
-                var items = new List<Item>();
-                var probe = new Item();
-                probe.SetDefaults(type);
-                if (probe.type != type)
+                var items = BuildItems(type, count);
+                if (items.Count == 0)
                 {
-                    caller.Reply($"invalid item type {type}", Microsoft.Xna.Framework.Color.Red);
+                    caller.Reply("Invalid item type or a request exceeding 4096 stacks.");
                     return;
                 }
 
-                var left = count;
-                while (left > 0)
-                {
-                    var stack = Math.Min(left, Math.Max(1, probe.maxStack));
-                    var item = new Item();
-                    item.SetDefaults(type);
-                    item.stack = stack;
-                    items.Add(item);
-                    left -= stack;
-                }
-
-                var result = Run(store, cb => CommandFactory.Put(items, true, 0, cb));
-                caller.Reply($"fill type={type} count={count} status={result.Status} remaining={CountRemaining(result)}");
+                store.Push(CommandFactory.Put(items, true, 0, result =>
+                    caller.Reply($"fill type={type} count={count} status={result.Status} remaining={CountRemaining(result)}")));
                 return;
             }
 
@@ -107,16 +119,23 @@ public sealed class InventoryDebugCommand : ModCommand
                     return;
                 }
 
-                var result = Run(store, cb => CommandFactory.Take(type, count, true, 0, cb));
-                var taken = result.Payload as List<Item>;
-                caller.Reply($"take type={type} requested={count} status={result.Status} got={CountItems(taken)}");
-                if (taken is not null)
+                var player = caller.Player;
+                store.Push(CommandFactory.Take(type, count, true, 0, result =>
                 {
-                    foreach (var item in taken)
+                    if (!result.TryGetResultPayload<List<Item>>(out var taken))
                     {
-                        caller.Player.QuickSpawnItem(null, item);
+                        caller.Reply($"take failed: {result.Status}");
+                        return;
                     }
-                }
+
+                    var got = CountItems(taken);
+                    var overflow = new List<Item>();
+                    var delivered = PlayerItemDelivery.Give(player, taken, overflow);
+                    var dropped = PlayerItemDelivery.DropOverflow(player, overflow);
+                    var pending = CountItems(overflow);
+                    PlayerItemDelivery.Hold(player, overflow);
+                    caller.Reply($"take type={type} requested={count} status={result.Status} got={got} delivered={delivered} dropped={dropped} pending={pending}");
+                }));
 
                 return;
             }
@@ -129,8 +148,8 @@ public sealed class InventoryDebugCommand : ModCommand
                     return;
                 }
 
-                var result = Run(store, cb => CommandFactory.Move(source, destination, 0, cb));
-                caller.Reply($"move {source}->{destination} status={result.Status}");
+                store.Push(CommandFactory.Move(source, destination, 0,
+                    result => caller.Reply($"move {source}->{destination} status={result.Status}")));
                 return;
             }
 
@@ -143,7 +162,7 @@ public sealed class InventoryDebugCommand : ModCommand
                 }
 
                 var result = Run(store, cb => CommandFactory.QuerySlot(new[] { slotId }, cb));
-                if (result.Payload is SlotInfo[] info && info.Length > 0 && !info[0].IsAir)
+                if (result.ResultPayload is SlotInfo[] info && info.Length > 0 && info[0] is { IsAir: false })
                 {
                     caller.Reply($"slot={slotId} type={info[0].Type} stack={info[0].Stack} favorited={info[0].Favorited}");
                 }
@@ -167,6 +186,118 @@ public sealed class InventoryDebugCommand : ModCommand
         }
     }
 
+    private static void HandlePause(string[] args, CommandCaller caller)
+    {
+        if (Main.netMode != NetmodeID.SinglePlayer)
+        {
+            caller.Reply("Pause is available in singleplayer only.");
+            return;
+        }
+
+        var pause = InventorySystem.CommandsPaused;
+        if (args.Length > 1)
+        {
+            if (string.Equals(args[1], "on", StringComparison.OrdinalIgnoreCase))
+            {
+                pause = true;
+            }
+            else if (string.Equals(args[1], "off", StringComparison.OrdinalIgnoreCase))
+            {
+                pause = false;
+            }
+            else
+            {
+                caller.Reply("Usage: /li pause [on|off]", Microsoft.Xna.Framework.Color.Yellow);
+                return;
+            }
+        }
+        else
+        {
+            pause = !pause;
+        }
+
+        if (pause)
+        {
+            InventorySystem.PauseAllCommands();
+            caller.Reply("commands paused: new commands rejected; queued commands interrupted with ManualInterrupt.", Microsoft.Xna.Framework.Color.Yellow);
+        }
+        else
+        {
+            InventorySystem.ResumeAllCommands();
+            caller.Reply("commands resumed.", Microsoft.Xna.Framework.Color.Green);
+        }
+    }
+
+    private static void HandleRepair(string[] args, CommandCaller caller)
+    {
+        var world = false;
+        var status = false;
+        var cancel = false;
+        if (args.Length > 1)
+        {
+            if (string.Equals(args[1], "world", StringComparison.OrdinalIgnoreCase))
+            {
+                world = true;
+            }
+            else if (string.Equals(args[1], "status", StringComparison.OrdinalIgnoreCase))
+            {
+                status = true;
+            }
+            else if (string.Equals(args[1], "cancel", StringComparison.OrdinalIgnoreCase))
+            {
+                cancel = true;
+            }
+            else
+            {
+                caller.Reply("Usage: /li repair [world|status|cancel]", Microsoft.Xna.Framework.Color.Yellow);
+                return;
+            }
+        }
+
+        if (Main.netMode != NetmodeID.SinglePlayer)
+        {
+            caller.Reply("修复仅可在单机运行。", Microsoft.Xna.Framework.Color.Yellow);
+            return;
+        }
+
+        var store = world
+            ? InventorySystem.Instance?.WorldStore
+            : Main.LocalPlayer?.GetModPlayer<InventoryPlayer>()?.Store;
+
+        if (store is null)
+        {
+            caller.Reply(world ? "World store is not ready." : "Player store is not ready.", Microsoft.Xna.Framework.Color.Red);
+            return;
+        }
+
+        if (status)
+        {
+            var snapshot = store.GetRepairSnapshot();
+            caller.Reply(snapshot is null
+                ? "repair: no task has run yet."
+                : $"repair: total={snapshot.TotalPages} scanned={snapshot.ScannedPages} repaired={snapshot.RepairedPages} lockFailed={snapshot.LockFailedPages} failed={snapshot.FailedPages} canceled={snapshot.Canceled} running={store.IsRepairRunning}");
+            return;
+        }
+
+        if (cancel)
+        {
+            store.CancelPageRepair();
+            caller.Reply("repair cancel requested; it will stop after the current page.", Microsoft.Xna.Framework.Color.Yellow);
+            return;
+        }
+
+        if (!store.StartPageRepair(
+                _ => { },
+                report => Main.NewText($"[LI] repair {(world ? "world" : "player")}: total={report.TotalPages} repaired={report.RepairedPages} recovered={report.RecoverablePages} healthy={report.HealthyPages} lockFailed={report.LockFailedPages} failed={report.FailedPages} ioErrors={report.IoErrorPages} unsupported={report.UnsupportedVersionPages} modErrors={report.ModErrorPages} pages=[{string.Join(",", report.RepairedPageIndices)}] archive={report.ArchiveDirectory ?? "-"}"),
+                out var error))
+        {
+            caller.Reply($"repair {(world ? "world" : "player")} failed: {error}", Microsoft.Xna.Framework.Color.Red);
+            return;
+        }
+
+        caller.Reply($"repair {(world ? "world" : "player")} started in background.", Microsoft.Xna.Framework.Color.Yellow);
+    }
+
     private static void HandleNetwork(string[] args, string sub, CommandCaller caller)
     {
         if (Main.netMode != NetmodeID.MultiplayerClient)
@@ -185,9 +316,9 @@ public sealed class InventoryDebugCommand : ModCommand
                     return;
                 }
 
-                NetworkSystem.RequestPlayerCommand(CommandFactory.QueryType(type), result =>
+                void ShowQuery(CommandResult result)
                 {
-                    if (result.Payload is QueryTypeResult view)
+                    if (result.ResultPayload is QueryTypeResult view)
                     {
                         Main.NewText($"[LI][net] type={view.Type} count={view.Count} favorites={view.Favorites} pages={view.Pages.Length} flags={result.Status}");
                     }
@@ -195,29 +326,60 @@ public sealed class InventoryDebugCommand : ModCommand
                     {
                         Main.NewText($"[LI][net] query failed: {result.Status}");
                     }
-                });
+                }
+
+                var command = CommandFactory.QueryType(type);
+                if (args.Length > 2 && string.Equals(args[2], "world", StringComparison.OrdinalIgnoreCase))
+                {
+                    NetworkSystem.RequestWorldCommand(command, ShowQuery);
+                }
+                else
+                {
+                    NetworkSystem.RequestPlayerCommand(command, ShowQuery);
+                }
+
                 caller.Reply("net query sent");
+                return;
+            }
+
+            if (sub is "netresult" or "netcollect")
+            {
+                if (args.Length != 2 || !Guid.TryParse(args[1], out var id) || id == Guid.Empty)
+                {
+                    caller.Reply($"Usage: /li {sub} <operation-id>");
+                    return;
+                }
+
+                NetworkSystem.RequestWorldResult(id, ReplyNetworkResult);
+                return;
+            }
+
+            if (sub == "netmove")
+            {
+                if (!TryInt(args, 1, out var source) || !TryInt(args, 2, out var destination))
+                {
+                    caller.Reply("Usage: /li netmove <source> <destination>");
+                    return;
+                }
+
+                var id = NetworkSystem.RequestRecoverableWorldTransaction(CommandFactory.Move(source, destination), ReplyNetworkResult);
+                caller.Reply($"world request {id:N}");
                 return;
             }
 
             if (!TryInt(args, 1, out var itemType) || !TryInt(args, 2, out var count) || count <= 0)
             {
-                caller.Reply("Usage: /li netfill <type> <count>", Microsoft.Xna.Framework.Color.Yellow);
+                caller.Reply($"Usage: /li {sub} <type> <count>", Microsoft.Xna.Framework.Color.Yellow);
                 return;
             }
 
-            var items = BuildItems(itemType, count);
-            if (items.Count == 0)
+            var request = sub switch
             {
-                caller.Reply($"invalid item type {itemType}", Microsoft.Xna.Framework.Color.Red);
-                return;
-            }
-
-            NetworkSystem.RequestPlayerCommand(CommandFactory.Put(items, true), result =>
-            {
-                Main.NewText($"[LI][net] fill type={itemType} count={count} status={result.Status} remaining={CountRemaining(result)}");
-            });
-            caller.Reply("net fill sent");
+                "netfill" => NetworkSystem.RequestRecoverableDebugFill(itemType, count, ReplyNetworkResult),
+                "nettake" => NetworkSystem.RequestRecoverableWorldTransaction(CommandFactory.Take(itemType, count, true), ReplyNetworkResult),
+                _ => Guid.Empty
+            };
+            caller.Reply($"world request {request:N}");
         }
         catch (Exception e)
         {
@@ -225,12 +387,23 @@ public sealed class InventoryDebugCommand : ModCommand
         }
     }
 
+    private static void ReplyNetworkResult(CommandResult result)
+    {
+        var detail = result.ResultPayload is int count ? $" count={count}" : string.Empty;
+        Main.NewText($"[LI][net] {result.Status}{detail}");
+    }
+
     private static List<Item> BuildItems(int type, int count)
     {
         var items = new List<Item>();
+        if (type <= 0 || type >= ItemLoader.ItemCount || count <= 0)
+        {
+            return items;
+        }
+
         var probe = new Item();
         probe.SetDefaults(type);
-        if (probe.type != type)
+        if (probe.type != type || (long)count > 4096L * Math.Max(1, probe.maxStack))
         {
             return items;
         }
@@ -251,16 +424,20 @@ public sealed class InventoryDebugCommand : ModCommand
 
     private static CommandResult Run(InventoryStore store, Func<Action<CommandResult>, Command> factory)
     {
-        CommandResult result = default;
-        using var done = new ManualResetEventSlim(false);
-        var command = factory(r =>
-        {
-            result = r;
-            done.Set();
-        });
+        var command = factory(_ => { });
         store.Push(command);
-        done.Wait(5000);
-        return result;
+        // Pump 有每次批次数上限；只 Pump 一次可能让后排队的 Take 尚未执行，
+        // 但它之后仍会修改 Store，造成结果未交付。最多排空队列上限对应的批次数。
+        var maxPasses = store.Config.MaxQueuedCommands;
+        for (var pass = 0; pass < maxPasses && !command.Done.IsSet; pass++)
+        {
+            if (store.Pump() == 0)
+            {
+                break;
+            }
+        }
+
+        return command.Done.IsSet ? command.Result : CommandResult.Fail(CommandStatus.InternalError);
     }
 
     private static bool TryInt(string[] args, int index, out int value)
@@ -269,19 +446,19 @@ public sealed class InventoryDebugCommand : ModCommand
         return args.Length > index && int.TryParse(args[index], out value);
     }
 
-    private static int CountRemaining(CommandResult result)
+    private static long CountRemaining(CommandResult result)
     {
-        return result.Payload is List<Item> remaining ? CountItems(remaining) : 0;
+        return result.ResultPayload is List<Item> remaining ? CountItems(remaining) : 0;
     }
 
-    private static int CountItems(List<Item> items)
+    private static long CountItems(List<Item> items)
     {
         if (items is null)
         {
             return 0;
         }
 
-        var total = 0;
+        long total = 0;
         foreach (var item in items)
         {
             if (item is not null)
@@ -293,6 +470,4 @@ public sealed class InventoryDebugCommand : ModCommand
         return total;
     }
 }
-#endif
-
 
