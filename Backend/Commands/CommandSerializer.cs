@@ -13,9 +13,10 @@ public static class CommandSerializer
 {
     public static TagCompound Save(Command command)
     {
-        if (command is null || command.Kind == CommandKind.Escape)
+        ArgumentNullException.ThrowIfNull(command);
+        if (command.Kind is CommandKind.Escape or CommandKind.SkipIf)
         {
-            throw new NotSupportedException("Escape commands cannot be serialized.");
+            throw new NotSupportedException("Commands with local callbacks cannot be serialized.");
         }
 
         var tag = new TagCompound
@@ -65,6 +66,8 @@ public static class CommandSerializer
         }
 
         var kind = (CommandKind)tag.Get<byte>("kind");
+        if (kind is CommandKind.Escape or CommandKind.SkipIf)
+            throw new NotSupportedException("Commands with local callbacks cannot be serialized.");
         var timeout = tag.Get<int>("timeout");
         var strong = tag.Get<byte>("strong") != 0;
         var slots = tag.Get<int[]>("slots") ?? Array.Empty<int>();

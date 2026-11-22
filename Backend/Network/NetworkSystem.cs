@@ -756,8 +756,8 @@ public static partial class NetworkSystem
             if (payload is PutPayload put)
             {
                 originalItems = new List<Item>(put.Items);
-                // Store hooks can mutate input stacks. Keep the original reservation intact until commit.
-                payload = new PutPayload { Items = originalItems.ConvertAll(item => item.Clone()), Spill = put.Spill };
+                // Put transfers whole stacks by reference and isolates in-place stack hooks itself.
+                payload = new PutPayload { Items = originalItems, Spill = put.Spill };
             }
 
             var executable = new Command(reserved.Kind, 0, reserved.Access, payload);

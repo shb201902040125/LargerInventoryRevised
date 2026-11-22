@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Threading.Tasks;
 using LargerInventory.Backend.Storage;
 using Terraria;
-using Terraria.ModLoader;
 
 namespace LargerInventory.Backend.Commands;
 
@@ -106,7 +105,9 @@ internal sealed partial class CommandExecutor
 
     private static bool CanSchedule(Command command, int slotLimit, out bool readOnly)
     {
-        readOnly = command.Kind == CommandKind.QuerySlot || command.InputPayload is EscapePayload { ReadOnly: true };
+        // Borrowed escapes expose live items, so isolate them even under the read-only contract.
+        readOnly = command.Kind == CommandKind.QuerySlot ||
+            command.InputPayload is EscapePayload { ReadOnly: true, CloneItems: true };
         if (!command.Access.IsStrong || command.Access.Slots.Length == 0 || command.Access.Slots.Length > slotLimit)
             return false;
         return command.Kind switch
@@ -132,9 +133,12 @@ internal sealed partial class CommandExecutor
         return work;
     }
 
+    private CommandResult ExecuteClonedEscape(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages)
+        => ExecuteConcurrentEscape(command, touchedPages, pinnedPages);
+
     private CommandResult ExecuteConcurrentEscape(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages)
     {
-        // A solitary, oversized or cold opt-in command keeps the same snapshot semantics.
+        // Solitary, oversized and cold commands use the same slot access as a wave.
         var work = new SlotWork(command);
         for (var i = 0; i < work.Slots.Length; i++)
         {
@@ -155,6 +159,7 @@ internal sealed partial class CommandExecutor
         public Item[] Slots { get; } = new Item[command.Access.Slots.Length];
         public ItemPage[] Pages { get; } = new ItemPage[command.Access.Slots.Length];
         private bool _publish;
+        private bool _refreshBorrowedEscape;
         private uint _changed;
         private Item[] _escapeWrites;
 
@@ -182,6 +187,15 @@ internal sealed partial class CommandExecutor
 
         private CommandResult RunEscape(EscapePayload payload)
         {
+            if (!payload.CloneItems)
+            {
+                // Refresh even when the callback fails or throws, since it can mutate live items.
+                _refreshBorrowedEscape = true;
+                var borrowedResult = payload.Callback(Slots);
+                _publish = !payload.ReadOnly && borrowedResult.IsOk;
+                return borrowedResult;
+            }
+
             var copies = Array.ConvertAll(Slots, item => item.Clone());
             var result = payload.Callback(copies);
             if (!payload.ReadOnly && result.IsOk)
@@ -218,7 +232,7 @@ internal sealed partial class CommandExecutor
                     var item = Slots[i];
                     if (item.IsAir || (payload.AvoidFavorited && item.favorited)) continue;
                     if (item.type != payload.Type || (payload.DestinationSnapshot is not null &&
-                        !ItemLoader.CanStack(payload.DestinationSnapshot.Clone(), item.Clone())))
+                        !CanStackForTake(payload.DestinationSnapshot, item)))
                     {
                         status |= CommandStatus.TypeMismatch;
                         continue;
@@ -231,6 +245,7 @@ internal sealed partial class CommandExecutor
                     }
                     else
                     {
+                        // Split hooks can throw after mutating the remainder. Keep the live item intact.
                         var rest = item.Clone();
                         results.Add(Split(rest, count));
                         Set(i, rest);
@@ -254,6 +269,7 @@ internal sealed partial class CommandExecutor
             foreach (var input in payload.Items)
             {
                 var source = input;
+                var stagedSource = false;
                 var blocked = CommandStatus.Ok;
                 for (var i = 0; i < Slots.Length && !source.IsAir; i++)
                 {
@@ -267,6 +283,7 @@ internal sealed partial class CommandExecutor
                     {
                         Set(i, next);
                         source = remainder;
+                        stagedSource = true;
                     }
                     else blocked |= CommandStatus.TargetOccupied | CommandStatus.TypeMismatch;
                 }
@@ -280,9 +297,13 @@ internal sealed partial class CommandExecutor
                     }
                     else
                     {
-                        var remainder = source.Clone();
-                        Set(i, Split(remainder, source.maxStack));
-                        source = remainder;
+                        // Keep caller-owned input intact on failure. A staged remainder already belongs to this work.
+                        if (!stagedSource)
+                        {
+                            source = source.Clone();
+                            stagedSource = true;
+                        }
+                        Set(i, Split(source, source.maxStack));
                     }
                 }
                 if (source is not null && !source.IsAir)
@@ -326,12 +347,13 @@ internal sealed partial class CommandExecutor
 
         public void Publish(CommandExecutor executor, HashSet<int> touchedPages)
         {
-            if (!_publish) return;
+            if (!_publish && !_refreshBorrowedEscape) return;
             for (var i = 0; i < Slots.Length; i++)
             {
-                if (_escapeWrites is null && (_changed & (1u << i)) == 0) continue;
+                if (!_refreshBorrowedEscape && _escapeWrites is null && (_changed & (1u << i)) == 0) continue;
                 var page = Pages[i];
-                page.Slots[SlotOf(Command.Access.Slots[i])] = (_escapeWrites ?? Slots)[i];
+                if (_publish)
+                    page.Slots[SlotOf(Command.Access.Slots[i])] = (_escapeWrites ?? Slots)[i] ?? new Item();
                 executor.MarkChanged(page, touchedPages);
             }
         }

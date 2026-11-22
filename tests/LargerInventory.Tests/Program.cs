@@ -50,6 +50,7 @@ internal static partial class Program
         RunStorageTests();
         RunCommandTests();
         RunQueueP0Tests();
+        RunQueueSkipTests();
         RunBatchPageTests();
         RunBatchConcurrencyTests();
         RunBatchSummaryTests();

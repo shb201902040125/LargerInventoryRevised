@@ -32,7 +32,8 @@ public enum CommandStatus
     ManualInterrupt = 1 << 16,
     Preparing = 1 << 17,
     PendingDelivery = 1 << 18,
-    Retired = 1 << 19
+    Retired = 1 << 19,
+    Skipped = 1 << 20
 
     // TIMEOUT 不属于执行器状态：接入层自行等待时由接入层定义。
 }
@@ -83,7 +84,8 @@ public enum CommandKind
     Take,
     Put,
     Move,
-    Escape
+    Escape,
+    SkipIf
 }
 
 /// <summary>强指定：给出明确槽位；弱指定：给出类型/数量，由执行器贪心选槽。</summary>
@@ -150,6 +152,7 @@ public sealed class EscapePayload
     public Func<ICollection<Item>, CommandResult> Callback;
     internal bool Concurrent { get; init; }
     internal bool ReadOnly { get; init; }
+    internal bool CloneItems { get; init; }
 }
 
 public sealed class QuerySlotPayload
@@ -311,22 +314,37 @@ public static class CommandFactory
     }
 
     /// <summary>
-    /// 对指定槽位的副本运行操作，可能在工作线程执行。集合按参数顺序包含空槽，
-    /// 支持按索引替换元素。只读操作丢弃更改，写操作仅在返回 Ok 后发布槽位。
+    /// 对指定槽位运行操作，可能在工作线程执行。集合按参数顺序包含空槽，支持按索引替换元素。
+    /// 默认借用仓库物品，只读回调不得修改它们。借用期间的原地修改无法回滚。
+    /// cloneItems 为 true 时隔离物品变更，只读或失败时丢弃。物品引用只能在回调期间使用。
+    /// 替换槽位时应移交物品所有权，每个非空槽位须持有独立的 Item 实例。
     /// 回调应自行同步共享状态，并且不能等待当前仓库中的后续命令。
     /// </summary>
     public static Command EscapeConcurrent(int[] slots, bool readOnly, Func<ICollection<Item>, CommandResult> action,
-        int timeoutMs = 0, Action<CommandResult> callback = null)
+        int timeoutMs = 0, Action<CommandResult> callback = null, bool cloneItems = false)
     {
         return new Command(CommandKind.Escape, timeoutMs, AccessSet.Strong(slots),
-            new EscapePayload { Callback = action, Concurrent = true, ReadOnly = readOnly }, callback);
+            new EscapePayload { Callback = action, Concurrent = true, ReadOnly = readOnly, CloneItems = cloneItems }, callback);
     }
 
+    /// <summary>默认借用非空物品。借用引用只在回调期间有效，原地修改即时生效。</summary>
     public static Command Escape(int[] slots, Func<ICollection<Item>, CommandResult> action, int timeoutMs = 0,
-        Action<CommandResult> callback = null)
+        Action<CommandResult> callback = null, bool cloneItems = false)
     {
         return new Command(CommandKind.Escape, timeoutMs,
             AccessSet.Strong(slots),
-            new EscapePayload { Callback = action }, callback);
+            new EscapePayload { Callback = action, CloneItems = cloneItems }, callback);
+    }
+
+    /// <summary>
+    /// 等待此前的命令结算，条件为 true 时跳过后续命令直到第一道显式 Boundary()。
+    /// 可分次压入，按实际入队顺序确定范围。队首到达此处后会一直等边界。
+    /// 调用方应预留一个队列名额给边界，或将本指令和边界一次批量压入，以免满队列拒绝边界。
+    /// 谓词可读取前序指令的 Result，不应依赖其回调触发时间。谓词异常时也跳过后续命令。
+    /// </summary>
+    public static Command SkipIf(Func<bool> predicate, Action<CommandResult> callback = null)
+    {
+        ArgumentNullException.ThrowIfNull(predicate);
+        return new Command(CommandKind.SkipIf, 0, AccessSet.ForWeak(default), predicate, callback);
     }
 }

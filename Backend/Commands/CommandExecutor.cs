@@ -160,6 +160,9 @@ internal sealed partial class CommandExecutor
 
     internal CommandResult ExecuteTransactionCommand(Command command)
     {
+        if (command.Kind == CommandKind.SkipIf)
+            return Command.FailUnexecuted(command, CommandStatus.InvalidArg);
+
         if (!Monitor.IsEntered(_executeGate) || _executingThreadId != 0)
         {
             return Command.FailUnexecuted(command, CommandStatus.PageBusy);
@@ -203,6 +206,21 @@ internal sealed partial class CommandExecutor
                     }
 
                     break;
+                }
+
+                if (batch[index].Kind == CommandKind.SkipIf)
+                {
+                    _store.SyncSummaries(touchedPages);
+                    touchedPages.Clear();
+                    if (EvaluateSkip(batch[index]))
+                    {
+                        while (index + 1 < batch.Count && batch[index + 1].Kind != CommandKind.NopBoundary)
+                        {
+                            var skipped = batch[++index];
+                            skipped.Complete(Command.FailUnexecuted(skipped, CommandStatus.Skipped));
+                        }
+                    }
+                    continue;
                 }
 
                 var parallelCount = TryExecuteConcurrentWave(batch, index, pinnedPages, touchedPages);
@@ -366,6 +384,28 @@ internal sealed partial class CommandExecutor
         return valid;
     }
 
+    private static bool EvaluateSkip(Command command)
+    {
+        if (command.Access.IsStrong || command.InputPayload is not Func<bool> predicate)
+        {
+            command.Complete(CommandResult.Fail(CommandStatus.InvalidArg));
+            return true;
+        }
+
+        try
+        {
+            var skip = predicate();
+            command.Complete(CommandResult.Ok(skip));
+            return skip;
+        }
+        catch (Exception error)
+        {
+            Debug.Error_Internal(error);
+            command.Complete(CommandResult.Fail(CommandStatus.InternalError));
+            return true;
+        }
+    }
+
     private static void CompleteAndNotify(Command command, CommandResult result)
     {
         command.Complete(result);
@@ -446,6 +486,8 @@ internal sealed partial class CommandExecutor
             CommandKind.Move => ExecuteMove(command, touchedPages, pinnedPages),
             CommandKind.Escape when command.InputPayload is EscapePayload { Concurrent: true } =>
                 ExecuteConcurrentEscape(command, touchedPages, pinnedPages),
+            CommandKind.Escape when command.InputPayload is EscapePayload { CloneItems: true } =>
+                ExecuteClonedEscape(command, touchedPages, pinnedPages),
             CommandKind.Escape => ExecuteEscape(command, touchedPages, pinnedPages),
             _ => CommandResult.Fail(CommandStatus.InvalidArg)
         };
@@ -559,7 +601,7 @@ internal sealed partial class CommandExecutor
                 }
 
                 if (item.type != payload.Type || (payload.DestinationSnapshot is not null &&
-                    !ItemLoader.CanStack(payload.DestinationSnapshot.Clone(), item.Clone())))
+                    !CanStackForTake(payload.DestinationSnapshot, item)))
                 {
                     if (command.Access.IsStrong) status |= CommandStatus.TypeMismatch;
                     continue;
@@ -625,6 +667,7 @@ internal sealed partial class CommandExecutor
             foreach (var input in inputs)
             {
                 var source = input;
+                var ownsSource = false;
                 var blocked = CommandStatus.Ok;
 
                 void MergeInto(ItemPage page, int slot)
@@ -648,6 +691,7 @@ internal sealed partial class CommandExecutor
                     }
                     Place(page, slot, nextDestination);
                     source = nextSource;
+                    ownsSource = true;
                 }
 
                 void FillEmpty(ItemPage page, int slot)
@@ -660,9 +704,12 @@ internal sealed partial class CommandExecutor
                     }
                     else
                     {
-                        var remainder = source.Clone();
-                        Place(page, slot, Split(remainder, source.maxStack));
-                        source = remainder;
+                        if (!ownsSource)
+                        {
+                            source = source.Clone();
+                            ownsSource = true;
+                        }
+                        Place(page, slot, Split(source, source.maxStack));
                     }
                 }
 
@@ -776,6 +823,9 @@ internal sealed partial class CommandExecutor
         }
         return capacity;
     }
+
+    // CanStack is a compatibility query. Hooks must leave both arguments unchanged.
+    private static bool CanStackForTake(Item destination, Item source) => ItemLoader.CanStack(destination, source);
 
     private static bool TryMerge(Item destination, Item source, out Item nextDestination, out Item nextSource, out int moved)
     {

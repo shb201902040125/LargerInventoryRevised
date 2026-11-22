@@ -19,6 +19,8 @@ internal static partial class Program
         Run(nameof(BatchConcurrent_DisjointWritesOverlapAndBufferCallbacksInFifoOrder));
         Run(nameof(BatchConcurrent_ConflictingCommandsObserveWritesInFifoOrder));
         Run(nameof(BatchConcurrent_WeakQuerySeesPriorWritesBeforeLaterWrites));
+        Run(nameof(BatchConcurrent_BorrowedFailureRefreshesSummaryWithoutReplacingSlots));
+        Run(nameof(BatchConcurrent_BorrowedReadsOnSameSlotRunSerially));
     }
 
     private static InventoryStore CreateConcurrentBatchStore() => new(new StoreConfig
@@ -48,7 +50,7 @@ internal static partial class Program
             firstChangedSnapshot.Set();
             overlapped = secondReadSnapshot.Wait(ConcurrentBatchWait);
             return CommandResult.Ok();
-        }, timeoutMs: BatchDeferred);
+        }, timeoutMs: BatchDeferred, cloneItems: true);
         var second = CommandFactory.EscapeConcurrent(slots, readOnly: true, items =>
         {
             if (firstChangedSnapshot.Wait(ConcurrentBatchWait))
@@ -58,7 +60,7 @@ internal static partial class Program
             }
             secondReadSnapshot.Set();
             return CommandResult.Ok();
-        }, timeoutMs: BatchDeferred);
+        }, timeoutMs: BatchDeferred, cloneItems: true);
 
         PumpBatch(store, first, second, CommandFactory.Boundary());
 
@@ -95,7 +97,7 @@ internal static partial class Program
             overlapped = secondWrote.Wait(ConcurrentBatchWait);
             return CommandResult.Ok();
         }, timeoutMs: BatchDeferred, callback: result =>
-            callbackOrder.Enqueue(result.IsOk && Volatile.Read(ref barrierRan) == 1 ? 1 : -1));
+            callbackOrder.Enqueue(result.IsOk && Volatile.Read(ref barrierRan) == 1 ? 1 : -1), cloneItems: true);
         var second = CommandFactory.EscapeConcurrent(new[] { secondSlot }, readOnly: false, items =>
         {
             secondEnteredInTime = firstEntered.Wait(ConcurrentBatchWait);
@@ -104,7 +106,7 @@ internal static partial class Program
             secondWrote.Set();
             return CommandResult.Ok();
         }, timeoutMs: BatchDeferred, callback: result =>
-            callbackOrder.Enqueue(result.IsOk && Volatile.Read(ref barrierRan) == 1 ? 2 : -2));
+            callbackOrder.Enqueue(result.IsOk && Volatile.Read(ref barrierRan) == 1 ? 2 : -2), cloneItems: true);
         var barrier = CommandFactory.Escape(new[] { firstSlot }, _ =>
         {
             Volatile.Write(ref barrierRan, 1);
@@ -177,5 +179,80 @@ internal static partial class Program
             between.Count == 11, "a weak query in the middle of a batch must see only preceding writes");
         Expect(after.Result.IsOk && after.Result.TryGetResultPayload<QueryTypeResult>(out var final) &&
             final.Count == 15, "the final weak query must see both writes");
+    }
+
+    private static void BatchConcurrent_BorrowedFailureRefreshesSummaryWithoutReplacingSlots()
+    {
+        using var store = CreateConcurrentBatchStore();
+        var page = store.AllocatePage();
+        var live = page.Slots[0] = Stack(11, 3);
+        var slot = BatchSlot(page);
+        var emptySlot = BatchSlot(page, 1);
+        store.SyncSummaries(new HashSet<int> { page.PageIndex });
+        var receivedLive = false;
+        var includedAir = false;
+        var failed = CommandFactory.EscapeConcurrent(new[] { emptySlot, slot }, readOnly: false, items =>
+        {
+            var slots = (Item[])items;
+            includedAir = slots[0].IsAir;
+            receivedLive = ReferenceEquals(slots[1], live);
+            slots[1].stack = 7;
+            slots[1] = Stack(11, 99);
+            slots[0] = Stack(11, 20);
+            return CommandResult.Fail(CommandStatus.NoSpace);
+        }, timeoutMs: BatchDeferred);
+        var disjoint = CommandFactory.EscapeConcurrent(new[] { BatchSlot(page, 2) }, readOnly: true,
+            _ => CommandResult.Ok(), timeoutMs: BatchDeferred);
+        var query = CommandFactory.QueryType(11);
+        PumpBatch(store, failed, disjoint, query);
+
+        Expect(receivedLive && includedAir, "borrowed escapes expose live items and preserve empty slot positions");
+        Expect(failed.Result.Status == CommandStatus.NoSpace && disjoint.Result.IsOk &&
+            ReferenceEquals(page.Slots[0], live) && page.Slots[1].IsAir,
+            "failed borrowed writes must discard index replacements");
+        Expect(query.Result.IsOk && query.Result.TryGetResultPayload<QueryTypeResult>(out var summary) &&
+            summary.Count == 7, "a weak query must see the live mutation even after a failed callback");
+
+        var replacement = Stack(12, 2);
+        var succeeded = CommandFactory.EscapeConcurrent(new[] { slot, emptySlot }, readOnly: false, items =>
+        {
+            var slots = (Item[])items;
+            slots[0] = null;
+            slots[1] = replacement;
+            return CommandResult.Ok();
+        });
+        PumpBatch(store, succeeded);
+
+        Expect(succeeded.Result.IsOk && page.Slots[0].IsAir && ReferenceEquals(page.Slots[1], replacement),
+            "a successful borrowed write must publish replacements and normalize null to an empty item");
+    }
+
+    private static void BatchConcurrent_BorrowedReadsOnSameSlotRunSerially()
+    {
+        using var store = CreateConcurrentBatchStore();
+        var page = store.AllocatePage();
+        var live = page.Slots[0] = Stack(11, 3);
+        var slots = new[] { BatchSlot(page) };
+        var ownerThread = Environment.CurrentManagedThreadId;
+        var firstThread = 0;
+        var secondThread = 0;
+        var secondSawLive = false;
+        var first = CommandFactory.EscapeConcurrent(slots, readOnly: true, items =>
+        {
+            firstThread = Environment.CurrentManagedThreadId;
+            ((Item[])items)[0] = Stack(12, 9);
+            return CommandResult.Ok();
+        }, timeoutMs: BatchDeferred);
+        var second = CommandFactory.EscapeConcurrent(slots, readOnly: true, items =>
+        {
+            secondThread = Environment.CurrentManagedThreadId;
+            secondSawLive = ReferenceEquals(items.Single(), live);
+            return CommandResult.Ok();
+        }, timeoutMs: BatchDeferred);
+        PumpBatch(store, first, second, CommandFactory.Boundary());
+
+        Expect(first.Result.IsOk && second.Result.IsOk && firstThread == ownerThread && secondThread == ownerThread,
+            "same-slot borrowed reads must conflict and execute serially");
+        Expect(secondSawLive && ReferenceEquals(page.Slots[0], live), "a read-only escape must discard index replacements");
     }
 }

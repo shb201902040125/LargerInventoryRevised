@@ -11,7 +11,8 @@ internal sealed class CommandQueue
 {
     private readonly object _gate = new();
     private readonly Queue<Command> _queue = new();
-    private readonly Queue<long> _boundaries = new();
+    private readonly Queue<(long Position, bool IsSkip)> _readyBoundaries = new();
+    private readonly Queue<long> _explicitBoundaries = new();
     private readonly LinkedList<(long Position, long Deadline)> _deadlines = new();
     private long _headPosition;
 
@@ -78,23 +79,43 @@ internal sealed class CommandQueue
         }
     }
 
-    /// <summary>取出到第一个立即边界的前缀；没有立即边界时，取出到最早到期指令的前缀。</summary>
+    /// <summary>按立即边界或截止时间取出普通前缀。队首为 SkipIf 时，整段取出至下一个显式边界。</summary>
     public bool TryTakeBatch(long now, int maxCommands, out List<Command> batch)
     {
         batch = null;
         lock (_gate)
         {
-            if (!_boundaries.TryPeek(out var endPosition))
+            var hasReadyBoundary = _readyBoundaries.TryPeek(out var ready);
+            int take;
+            if (hasReadyBoundary && ready.IsSkip && ready.Position == _headPosition)
             {
-                if (_deadlines.First is not { } first || first.Value.Deadline > now)
+                if (!_explicitBoundaries.TryPeek(out var boundary))
                 {
                     return false;
                 }
 
-                endPosition = first.Value.Position;
+                // An explicit NopBoundary is the only terminator once a SkipIf reaches the head.
+                take = (int)(boundary - _headPosition + 1);
+            }
+            else
+            {
+                long endPosition;
+                if (hasReadyBoundary)
+                {
+                    endPosition = ready.IsSkip ? ready.Position - 1 : ready.Position;
+                }
+                else if (_deadlines.First is { } first && first.Value.Deadline <= now)
+                {
+                    endPosition = first.Value.Position;
+                }
+                else
+                {
+                    return false;
+                }
+
+                take = (int)Math.Min(endPosition - _headPosition + 1, Math.Max(1, maxCommands));
             }
 
-            var take = (int)Math.Min(endPosition - _headPosition + 1, Math.Max(1, maxCommands));
             batch = new List<Command>(take);
             for (var i = 0; i < take; i++)
             {
@@ -102,9 +123,14 @@ internal sealed class CommandQueue
             }
 
             _headPosition += take;
-            if (_boundaries.TryPeek(out var boundary) && boundary < _headPosition)
+            while (_readyBoundaries.TryPeek(out var covered) && covered.Position < _headPosition)
             {
-                _boundaries.Dequeue();
+                _readyBoundaries.Dequeue();
+            }
+
+            while (_explicitBoundaries.TryPeek(out var coveredBoundary) && coveredBoundary < _headPosition)
+            {
+                _explicitBoundaries.Dequeue();
             }
 
             while (_deadlines.First is { } expired && expired.Value.Position < _headPosition)
@@ -123,7 +149,8 @@ internal sealed class CommandQueue
         {
             var all = new List<Command>(_queue);
             _queue.Clear();
-            _boundaries.Clear();
+            _readyBoundaries.Clear();
+            _explicitBoundaries.Clear();
             _deadlines.Clear();
             _headPosition = 0;
             return all;
@@ -134,9 +161,15 @@ internal sealed class CommandQueue
     {
         var position = _headPosition + _queue.Count;
         _queue.Enqueue(command);
-        if (command.TimeoutMs == 0)
+        if (command.Kind == CommandKind.NopBoundary)
         {
-            _boundaries.Enqueue(position);
+            _explicitBoundaries.Enqueue(position);
+        }
+
+        var isSkip = command.Kind == CommandKind.SkipIf;
+        if (isSkip || command.TimeoutMs == 0)
+        {
+            _readyBoundaries.Enqueue((position, isSkip));
             return;
         }
 
