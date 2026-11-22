@@ -33,7 +33,9 @@ public enum CommandStatus
     Preparing = 1 << 17,
     PendingDelivery = 1 << 18,
     Retired = 1 << 19,
-    Skipped = 1 << 20
+    Skipped = 1 << 20,
+    ControlFlowLimit = 1 << 21,
+    RolledBack = 1 << 22
 
     // TIMEOUT 不属于执行器状态：接入层自行等待时由接入层定义。
 }
@@ -85,7 +87,10 @@ public enum CommandKind
     Put,
     Move,
     Escape,
-    SkipIf
+    Label,
+    Br,
+    TransactionAction,
+    ControlTransaction
 }
 
 /// <summary>强指定：给出明确槽位；弱指定：给出类型/数量，由执行器贪心选槽。</summary>
@@ -336,15 +341,16 @@ public static class CommandFactory
             new EscapePayload { Callback = action, CloneItems = cloneItems }, callback);
     }
 
-    /// <summary>
-    /// 等待此前的命令结算，条件为 true 时跳过后续命令直到第一道显式 Boundary()。
-    /// 可分次压入，按实际入队顺序确定范围。队首到达此处后会一直等边界。
-    /// 调用方应预留一个队列名额给边界，或将本指令和边界一次批量压入，以免满队列拒绝边界。
-    /// 谓词可读取前序指令的 Result，不应依赖其回调触发时间。谓词异常时也跳过后续命令。
-    /// </summary>
-    public static Command SkipIf(Func<bool> predicate, Action<CommandResult> callback = null)
-    {
-        ArgumentNullException.ThrowIfNull(predicate);
-        return new Command(CommandKind.SkipIf, 0, AccessSet.ForWeak(default), predicate, callback);
-    }
+    /// <summary>与同一次批量提交中的一条 Br 严格配对。</summary>
+    public static Command Label(BranchLabel label, Action<CommandResult> callback = null) =>
+        new(CommandKind.Label, 0, null, label ?? throw new ArgumentNullException(nameof(label)), callback);
+
+    /// <summary>等待此前实际执行的指令完成。谓词为真时跳转到对应 Label。</summary>
+    public static Command Br(BranchLabel target, Func<BranchContext, bool> predicate, Action<CommandResult> callback = null) =>
+        new(CommandKind.Br, 0, null, new BranchPayload(target ?? throw new ArgumentNullException(nameof(target)),
+            predicate ?? throw new ArgumentNullException(nameof(predicate))), callback);
+
+    /// <summary>显式创建或恢复事务保存点。仅可通过 PushControlTransaction 提交。</summary>
+    public static Command TransactionAction(Action<BranchContext> action, Action<CommandResult> callback = null) =>
+        new(CommandKind.TransactionAction, 0, null, action ?? throw new ArgumentNullException(nameof(action)), callback);
 }

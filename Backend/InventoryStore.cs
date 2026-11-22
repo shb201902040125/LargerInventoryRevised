@@ -122,18 +122,21 @@ public sealed class InventoryStore : IDisposable
         {
             throw new ArgumentNullException(nameof(command));
         }
-        if (!command.TryMarkSubmitted())
-            return;
-
         CommandStatus? rejection = null;
         lock (_lifecycleGate)
         {
+            if (!command.TryMarkSubmitted())
+                return;
             if (!_started)
             {
                 Start();
             }
 
-            if (_disposed || _disposing)
+            if (CommandQueue.RequiresBatch(command.Kind))
+            {
+                rejection = CommandStatus.InvalidArg;
+            }
+            else if (_disposed || _disposing)
             {
                 rejection = CommandStatus.InternalError;
             }
@@ -170,24 +173,35 @@ public sealed class InventoryStore : IDisposable
         {
             throw new ArgumentNullException(nameof(commands));
         }
+        var requiresBatch = false;
         foreach (var command in commands)
+        {
             ArgumentNullException.ThrowIfNull(command);
-        var submitted = new List<Command>(commands.Count);
-        foreach (var command in commands)
-            if (command.TryMarkSubmitted())
-                submitted.Add(command);
-        if (submitted.Count == 0)
-            return;
+            requiresBatch |= CommandQueue.RequiresBatch(command.Kind);
+        }
 
+        var submitted = new List<Command>(commands.Count);
         CommandStatus? rejection = null;
         lock (_lifecycleGate)
         {
+            foreach (var command in commands)
+                if (command.TryMarkSubmitted())
+                    submitted.Add(command);
+            if (submitted.Count == 0)
+                return;
+
             if (!_started)
             {
                 Start();
             }
 
-            if (_disposed || _disposing)
+            List<CommandQueue.ControlInterval> intervals = null;
+            if (requiresBatch && (submitted.Count != commands.Count ||
+                !CommandQueue.TryGetControlIntervals(submitted, Config.MaxControlFlowCommands, out intervals)))
+            {
+                rejection = CommandStatus.InvalidArg;
+            }
+            else if (_disposed || _disposing)
             {
                 rejection = CommandStatus.InternalError;
             }
@@ -203,7 +217,7 @@ public sealed class InventoryStore : IDisposable
             {
                 rejection = CommandStatus.PageBusy;
             }
-            else if (!Queue.TryPushBatch(submitted, Config.MaxQueuedCommands))
+            else if (!Queue.TryPushBatch(submitted, Config.MaxQueuedCommands, intervals))
             {
                 rejection = CommandStatus.Throttled;
             }
@@ -215,6 +229,48 @@ public sealed class InventoryStore : IDisposable
             {
                 RejectCommand(command, rejection.Value);
             }
+        }
+    }
+
+    /// <summary>提交不可拆分的内存事务。执行结束后由 settle 决定提交或恢复入口状态。</summary>
+    public void PushControlTransaction(IReadOnlyList<Command> commands,
+        Func<BranchContext, ControlTransactionDecision> settle, Action<CommandResult> callback = null)
+    {
+        ArgumentNullException.ThrowIfNull(commands);
+        ArgumentNullException.ThrowIfNull(settle);
+        var body = new List<Command>(commands).ToArray();
+        foreach (var command in body)
+            ArgumentNullException.ThrowIfNull(command);
+        var envelope = new Command(CommandKind.ControlTransaction, 0, null,
+            new ControlTransactionPayload(body, settle), callback);
+        var claimed = new List<Command>(body.Length);
+        CommandStatus? rejection = null;
+        lock (_lifecycleGate)
+        {
+            foreach (var command in body)
+                if (command.TryMarkSubmitted())
+                    claimed.Add(command);
+            if (claimed.Count != body.Length || body.Length == 0 ||
+                !CommandQueue.TryGetControlIntervals(body, Config.MaxControlFlowCommands, out _, transactional: true))
+            {
+                rejection = CommandStatus.InvalidArg;
+            }
+            else
+            {
+                if (!_started) Start();
+                if (_disposed || _disposing) rejection = CommandStatus.InternalError;
+                else if (Integration.InventorySystem.CommandsPaused) rejection = CommandStatus.ManualInterrupt;
+                else if (IsPreparing) rejection = CommandStatus.Preparing;
+                else if (_pendingCommit is not null) rejection = CommandStatus.PageBusy;
+                else if (!Queue.TryPushControlTransaction(envelope, body.Length, Config.MaxQueuedCommands))
+                    rejection = CommandStatus.Throttled;
+            }
+        }
+        if (rejection is { } status)
+        {
+            foreach (var command in claimed)
+                RejectCommand(command, status);
+            RejectCommand(envelope, status);
         }
     }
 

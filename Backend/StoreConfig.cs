@@ -26,6 +26,12 @@ public sealed class StoreConfig
     /// <summary>一次划批最多包含的指令数（控制单批执行量，不是背压）。调高可增加批内合并机会，并延长到达预算检查和回调的时间。</summary>
     public int MaxBatchCommands { get; set; } = 256;
 
+    /// <summary>不可拆分的控制流区间或事务的最大指令数。调高会增加单次推进及事务日志的开销。</summary>
+    public int MaxControlFlowCommands { get; set; } = 256;
+
+    /// <summary>一次控制流执行最多访问的指令数，重复访问也计入。调高允许更长的循环，也可能增加帧耗时。</summary>
+    public int MaxControlFlowSteps { get; set; } = 1024;
+
     /// <summary>同一批次内最多同时运行的独立指令数（上限 8）。设为 1 可关闭指令间并发。调高可容纳更多独立命令，同时增加线程池派发和等待成本。</summary>
     public int MaxConcurrentCommandsPerBatch { get; set; } = 4;
 
@@ -142,6 +148,8 @@ public sealed class StoreConfig
         MaxLoadedPages = Math.Max(1, MaxLoadedPages);
         PageIdleUnloadMs = Math.Max(0, PageIdleUnloadMs);
         MaxBatchCommands = Math.Clamp(MaxBatchCommands, 1, 4096);
+        MaxControlFlowCommands = Math.Clamp(MaxControlFlowCommands, 1, 4096);
+        MaxControlFlowSteps = Math.Max(1, MaxControlFlowSteps);
         MaxConcurrentCommandsPerBatch = Math.Clamp(MaxConcurrentCommandsPerBatch, 1, MaxSupportedConcurrentCommands);
         MaxConcurrentSlotsPerCommand = Math.Clamp(MaxConcurrentSlotsPerCommand, 1, MaxSupportedConcurrentSlots);
         MaxDrainBatches = Math.Max(1, MaxDrainBatches);

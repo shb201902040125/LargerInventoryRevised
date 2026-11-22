@@ -16,9 +16,9 @@
 	  <None Remove="tests\**" />
 	</ItemGroup>
 
-	<!-- 文档和调用示例仅供参考，不参与编译。tModLoader 打包另由 buildIgnore 排除 docs。 -->
+	<!-- 文档和示例源码由独立工程验证，buildIgnore 也会排除这两个目录。 -->
 	<ItemGroup>
-	  <Compile Remove="docs\**\*.cs" />
+	  <Compile Remove="docs\**\*.cs;example\**\*.cs" />
 	</ItemGroup>
 
 	<!-- References -->

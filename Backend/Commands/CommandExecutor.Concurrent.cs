@@ -136,7 +136,7 @@ internal sealed partial class CommandExecutor
     private CommandResult ExecuteClonedEscape(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages)
         => ExecuteConcurrentEscape(command, touchedPages, pinnedPages);
 
-    private CommandResult ExecuteConcurrentEscape(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages)
+    private CommandResult ExecuteConcurrentEscape(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages, bool forceClone = false)
     {
         // Solitary, oversized and cold commands use the same slot access as a wave.
         var work = new SlotWork(command);
@@ -148,7 +148,7 @@ internal sealed partial class CommandExecutor
             work.Pages[i] = page;
             work.Slots[i] = page.Slots[SlotOf(slotId)];
         }
-        var result = work.Run();
+        var result = work.Run(forceClone);
         work.Publish(this, touchedPages);
         return result;
     }
@@ -163,13 +163,13 @@ internal sealed partial class CommandExecutor
         private uint _changed;
         private Item[] _escapeWrites;
 
-        public CommandResult Run()
+        public CommandResult Run(bool forceClone = false)
         {
             try
             {
                 return Command.Kind switch
                 {
-                    CommandKind.Escape => RunEscape((EscapePayload)Command.InputPayload),
+                    CommandKind.Escape => RunEscape((EscapePayload)Command.InputPayload, forceClone),
                     CommandKind.QuerySlot => RunQuery(),
                     CommandKind.Take => RunTake((TakePayload)Command.InputPayload),
                     CommandKind.Put => RunPut((PutPayload)Command.InputPayload),
@@ -185,9 +185,9 @@ internal sealed partial class CommandExecutor
             }
         }
 
-        private CommandResult RunEscape(EscapePayload payload)
+        private CommandResult RunEscape(EscapePayload payload, bool forceClone)
         {
-            if (!payload.CloneItems)
+            if (!payload.CloneItems && !forceClone)
             {
                 // Refresh even when the callback fails or throws, since it can mutate live items.
                 _refreshBorrowedEscape = true;
@@ -353,7 +353,11 @@ internal sealed partial class CommandExecutor
                 if (!_refreshBorrowedEscape && _escapeWrites is null && (_changed & (1u << i)) == 0) continue;
                 var page = Pages[i];
                 if (_publish)
-                    page.Slots[SlotOf(Command.Access.Slots[i])] = (_escapeWrites ?? Slots)[i] ?? new Item();
+                {
+                    var slot = SlotOf(Command.Access.Slots[i]);
+                    executor.BeforeSlotWrite(page, slot);
+                    page.Slots[slot] = (_escapeWrites ?? Slots)[i] ?? new Item();
+                }
                 executor.MarkChanged(page, touchedPages);
             }
         }

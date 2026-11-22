@@ -7,14 +7,14 @@ namespace LargerInventory.Backend.Commands;
 
 /// <summary>
 /// 原生指令请求的 TagCompound 序列化（客户端 → 服务器）。
-/// ESCAPE 不序列化（第三方自行同步）。
+/// 逃逸和控制流命令仅在本地执行。
 /// </summary>
 public static class CommandSerializer
 {
     public static TagCompound Save(Command command)
     {
         ArgumentNullException.ThrowIfNull(command);
-        if (command.Kind is CommandKind.Escape or CommandKind.SkipIf)
+        if (command.Kind is CommandKind.Escape or CommandKind.Label or CommandKind.Br or CommandKind.TransactionAction or CommandKind.ControlTransaction)
         {
             throw new NotSupportedException("Commands with local callbacks cannot be serialized.");
         }
@@ -66,7 +66,7 @@ public static class CommandSerializer
         }
 
         var kind = (CommandKind)tag.Get<byte>("kind");
-        if (kind is CommandKind.Escape or CommandKind.SkipIf)
+        if (kind is CommandKind.Escape or CommandKind.Label or CommandKind.Br or CommandKind.TransactionAction or CommandKind.ControlTransaction)
             throw new NotSupportedException("Commands with local callbacks cannot be serialized.");
         var timeout = tag.Get<int>("timeout");
         var strong = tag.Get<byte>("strong") != 0;
