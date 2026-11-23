@@ -201,76 +201,69 @@ internal sealed partial class CommandExecutor
 
         var pinnedPages = new HashSet<int>();
         var touchedPages = new HashSet<int>();
+        var hasTake = batch.Exists(command => command.Kind == CommandKind.Take);
+        if (hasTake) BeginTakeBatch(touchedPages, pinnedPages);
+        Dictionary<Command, List<Item>> deliveries = null;
+        var failure = CommandStatus.Ok;
         var index = 0;
-
         try
         {
             for (; index < batch.Count; index++)
             {
                 if (Integration.InventorySystem.CommandsPaused)
                 {
-                    for (; index < batch.Count; index++)
-                    {
-                        if (!batch[index].Done.IsSet)
-                        {
-                            batch[index].Complete(Command.FailUnexecuted(batch[index], CommandStatus.ManualInterrupt));
-                        }
-                    }
-
+                    failure = CommandStatus.ManualInterrupt;
                     break;
                 }
-
                 var parallelCount = TryExecuteConcurrentWave(batch, index, pinnedPages, touchedPages);
                 if (parallelCount != 0)
                 {
                     index += parallelCount - 1;
                     continue;
                 }
-
                 var command = batch[index];
-                if (!Validate(command, out var validationResult))
-                {
-                    command.Complete(validationResult);
-                    continue;
-                }
-
-                _pageBusyHit = false;
-                _pageLoadFailedHit = false;
-                try
-                {
-                    if (command.Access.IsStrong && !TryReserveStrongSlots(command.Access))
-                    {
-                        command.Complete(Command.FailUnexecuted(command, CommandStatus.PageBusy));
-                        continue;
-                    }
-
-                    if (touchedPages.Count != 0 && !command.Access.IsStrong && command.Kind != CommandKind.NopBoundary)
-                    {
-                        _store.SyncSummaries(touchedPages);
-                        touchedPages.Clear();
-                    }
-                    ExecuteCommandSafe(command, touchedPages, pinnedPages);
-                }
-                finally
-                {
-                    _reservedSlots.Clear();
-                }
+                var result = ExecuteControlInstruction(command, hasTake, touchedPages, pinnedPages);
+                CompleteBatchInstruction(command, result);
             }
+            if (hasTake && failure == CommandStatus.Ok)
+                deliveries = ConfirmReservations(touchedPages);
         }
-        catch (Exception e)
+        catch (Exception error)
         {
-            Debug.Error_Internal(e);
-            for (var i = index; i < batch.Count; i++)
-            {
-                if (!batch[i].Done.IsSet)
-                {
-                    batch[i].Complete(Command.FailUnexecuted(batch[i], CommandStatus.InternalError));
-                }
-            }
+            Debug.Error_Internal(error);
+            failure = CommandStatus.InternalError;
         }
         finally
         {
-            FinishBatch(touchedPages);
+            try
+            {
+                if (hasTake && failure != CommandStatus.Ok)
+                    RestoreControlJournal(0);
+                if (hasTake)
+                {
+                    foreach (var command in batch)
+                    {
+                        if (failure != CommandStatus.Ok)
+                            command.Complete(Command.FailUnexecuted(command, failure | CommandStatus.RolledBack));
+                        else if (command.Kind == CommandKind.Take)
+                            command.Complete(new CommandResult(_takeBatchResults[command].Status,
+                                deliveries.GetValueOrDefault(command) ?? new List<Item>()));
+                        else
+                            command.Complete(_takeBatchResults[command]);
+                    }
+                }
+                else if (failure != CommandStatus.Ok)
+                {
+                    for (; index < batch.Count; index++)
+                        if (!batch[index].Done.IsSet)
+                            batch[index].Complete(Command.FailUnexecuted(batch[index], failure));
+                }
+            }
+            finally
+            {
+                if (hasTake) EndTakeBatch();
+                FinishBatch(touchedPages);
+            }
         }
 
         if (!notify) return;
@@ -407,9 +400,6 @@ internal sealed partial class CommandExecutor
         }
     }
 
-    private void ExecuteCommandSafe(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages) =>
-        command.Complete(RunCommandSafe(command, touchedPages, pinnedPages));
-
     private CommandResult RunCommandSafe(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages, bool isolateEscape = false)
     {
         CommandResult result;
@@ -467,9 +457,11 @@ internal sealed partial class CommandExecutor
             CommandKind.NopBoundary => CommandResult.Ok(),
             CommandKind.QueryType => ExecuteQueryType(command),
             CommandKind.QuerySlot => ExecuteQuerySlot(command, touchedPages, pinnedPages),
-            CommandKind.Take => ExecuteTake(command, touchedPages, pinnedPages),
+            CommandKind.Take => ExecuteTake(command, pinnedPages),
             CommandKind.Put => ExecutePut(command, touchedPages, pinnedPages),
             CommandKind.Move => ExecuteMove(command, touchedPages, pinnedPages),
+            CommandKind.Escape when command.Access.IsStrong && command.Access.Slots.Any(slot => ReservedQuantity(slot) != 0) =>
+                CommandResult.Fail(CommandStatus.PageBusy),
             CommandKind.Escape when isolateEscape && command.InputPayload is EscapePayload { Concurrent: false, CloneItems: false } =>
                 ExecuteEscape(command, touchedPages, pinnedPages, isolateItems: true),
             CommandKind.Escape when isolateEscape =>
@@ -487,19 +479,17 @@ internal sealed partial class CommandExecutor
     {
         var payload = (QueryTypePayload)command.InputPayload;
         var type = payload.Type;
-        var count = 0;
-        var favorites = 0;
-        var saturated = false;
+        long exactCount = 0;
+        long exactFavorites = 0;
         var pages = Array.Empty<int>();
 
-        if (_store.Config.EnableGlobalAggregate && _store.TypeIndex.TryGet(type, out count, out favorites, out pages, out saturated))
+        if (_store.Config.EnableGlobalAggregate &&
+            _store.TypeIndex.TryGetExact(type, out exactCount, out exactFavorites, out pages))
         {
             _pageWork += pages.Length;
         }
         else
         {
-            long exactCount = 0;
-            long exactFavorites = 0;
             var list = new List<int>();
             foreach (var page in _store.PageCache.AllocatedPages)
             {
@@ -518,11 +508,27 @@ internal sealed partial class CommandExecutor
                 }
             }
 
-            count = (int)Math.Min(exactCount, int.MaxValue);
-            favorites = (int)Math.Min(exactFavorites, int.MaxValue);
-            saturated = exactCount > int.MaxValue || exactFavorites > int.MaxValue;
             pages = list.ToArray();
         }
+
+        if (_reservedPageTypes is { Count: > 0 })
+        {
+            var availablePages = 0;
+            foreach (var pageIndex in pages)
+            {
+                var reserved = _reservedPageTypes.GetValueOrDefault((pageIndex, type));
+                exactCount -= reserved.Count;
+                exactFavorites -= reserved.Favorites;
+                if (reserved.Count == 0 || (_store.PageCache.Directory.TryGet(pageIndex, out var page) &&
+                    page.Summary.Types.TryGetValue(type, out var stat) && stat.ExactCount > reserved.Count))
+                    pages[availablePages++] = pageIndex;
+            }
+            if (availablePages != pages.Length) Array.Resize(ref pages, availablePages);
+        }
+
+        var count = (int)Math.Min(exactCount, int.MaxValue);
+        var favorites = (int)Math.Min(exactFavorites, int.MaxValue);
+        var saturated = exactCount > int.MaxValue || exactFavorites > int.MaxValue;
 
         var result = new QueryTypeResult
         {
@@ -566,6 +572,7 @@ internal sealed partial class CommandExecutor
             var item = page.Slots[SlotOf(slotId)];
             result[i].Type = item.type;
             result[i].Stack = item.stack;
+            result[i].AvailableStack = item.IsAir ? 0 : item.stack - ReservedQuantity(slotId);
             result[i].Favorited = item.favorited;
             result[i].IsAir = item.IsAir;
         }
@@ -573,10 +580,11 @@ internal sealed partial class CommandExecutor
         return new CommandResult(found > 0 && found < result.Length ? CommandStatus.Partial : CommandStatus.Ok, result);
     }
 
-    private CommandResult ExecuteTake(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages)
+    private CommandResult ExecuteTake(Command command, HashSet<int> pinnedPages)
     {
         var payload = (TakePayload)command.InputPayload;
-        var results = new List<Item>();
+        var selections = new List<TakeSelection>();
+        var checkpoint = _takeReservations.Count;
         var takeAll = payload.Count == int.MaxValue;
         var remaining = payload.Count;
         var status = CommandStatus.Ok;
@@ -585,55 +593,35 @@ internal sealed partial class CommandExecutor
             foreach (var (page, index) in EnumerateItemSlots(command.Access, payload.Type, pinnedPages, payload.AvoidFavorited))
             {
                 var item = page.Slots[index];
-                if (item.IsAir || (payload.AvoidFavorited && item.favorited))
-                {
-                    continue;
-                }
-
+                if (item.IsAir || (payload.AvoidFavorited && item.favorited)) continue;
+                var slotId = (page.PageIndex << 10) | index;
+                var available = item.stack - ReservedQuantity(slotId);
+                if (available <= 0) continue;
                 if (item.type != payload.Type || (payload.DestinationSnapshot is not null &&
                     !CanStackForTake(payload.DestinationSnapshot, item)))
                 {
                     if (command.Access.IsStrong) status |= CommandStatus.TypeMismatch;
                     continue;
                 }
-
+                if (payload.Predicate is not null && !payload.Predicate(item, slotId, available)) continue;
                 ReserveSlot(page, index, pinnedPages);
-                BeforeSlotWrite(page, index);
-                var count = takeAll ? item.stack : Math.Min(item.stack, remaining);
-                if (count == item.stack)
-                {
-                    page.ResetSlot(index);
-                    results.Add(item);
-                }
-                else
-                {
-                    var remainder = item.Clone();
-                    var taken = Split(remainder, count);
-                    page.Slots[index] = remainder;
-                    results.Add(taken);
-                }
-
-                if (!takeAll) remaining -= count;
-                MarkChanged(page, touchedPages);
-                if (!takeAll && remaining == 0) break;
+                var count = takeAll ? available : Math.Min(available, remaining);
+                AddTakeReservation(command, page, index, item, count);
+                selections.Add(new TakeSelection(slotId, count));
+                if (!takeAll && (remaining -= count) == 0) break;
             }
         }
-        catch (Exception e)
+        catch (Exception error)
         {
-            Debug.Error_Internal(e);
-            status |= CommandStatus.InternalError;
+            RestoreReservations(checkpoint);
+            Debug.Error_Internal(error);
+            return CommandResult.Fail(CommandStatus.InternalError, new TakePreview(Array.Empty<TakeSelection>()));
         }
-
-        if ((!takeAll && remaining > 0) || results.Count == 0)
-        {
-            status |= CommandStatus.NotEnough;
-        }
+        if ((!takeAll && remaining > 0) || selections.Count == 0) status |= CommandStatus.NotEnough;
         var fulfilled = !command.Access.IsStrong && !takeAll && remaining == 0;
-        if (results.Count > 0 && (status != CommandStatus.Ok || (!fulfilled && (_pageBusyHit || _pageLoadFailedHit))))
-        {
+        if (selections.Count > 0 && (status != CommandStatus.Ok || (!fulfilled && (_pageBusyHit || _pageLoadFailedHit))))
             status |= CommandStatus.Partial;
-        }
-        return new CommandResult(status, results);
+        return new CommandResult(status, new TakePreview(selections));
     }
 
     private CommandResult ExecutePut(Command command, HashSet<int> touchedPages, HashSet<int> pinnedPages)
@@ -664,6 +652,7 @@ internal sealed partial class CommandExecutor
 
                 void MergeInto(ItemPage page, int slot)
                 {
+                    if (ReservedQuantity((page.PageIndex << 10) | slot) != 0) return;
                     var destination = page.Slots[slot];
                     if (destination.IsAir) return;
                     if (destination.type != source.type)
@@ -856,6 +845,8 @@ internal sealed partial class CommandExecutor
             return CommandResult.Fail(_pageBusyHit ? CommandStatus.PageBusy : CommandStatus.PageLoadFailed);
         }
 
+        if (ReservedQuantity(payload.SourceSlot) != 0 || ReservedQuantity(payload.DestinationSlot) != 0)
+            return CommandResult.Fail(CommandStatus.PageBusy);
         var sourceIndex = SlotOf(payload.SourceSlot);
         var destinationIndex = SlotOf(payload.DestinationSlot);
         var source = sourcePage.Slots[sourceIndex];
@@ -910,6 +901,8 @@ internal sealed partial class CommandExecutor
             var item = page.Slots[slot];
             if (!item.IsAir)
             {
+                if (ReservedQuantity((page.PageIndex << 10) | slot) != 0)
+                    return CommandResult.Fail(CommandStatus.PageBusy);
                 ReserveSlot(page, slot, pinnedPages);
                 if (isolateItems)
                 {
@@ -963,13 +956,19 @@ internal sealed partial class CommandExecutor
         long Estimate(ItemPage page)
         {
             if (!page.Summary.Types.TryGetValue(type, out var stat)) return 0;
-            if (!avoidFavorited || stat.ExactFavorites == 0) return stat.ExactCount;
-            if (!page.Loaded) return stat.ExactCount - stat.ExactFavorites;
-            long count = 0;
-            foreach (var item in page.Slots)
-                if (!item.IsAir && item.type == type && !item.favorited)
-                    count += item.stack;
-            return count;
+            if (avoidFavorited && stat.ExactFavorites != 0 && page.Loaded)
+            {
+                long count = 0;
+                for (var slot = 0; slot < page.Slots.Length; slot++)
+                {
+                    var item = page.Slots[slot];
+                    if (!item.IsAir && item.type == type && !item.favorited)
+                        count += item.stack - ReservedQuantity((page.PageIndex << 10) | slot);
+                }
+                return count;
+            }
+            var reserved = _reservedPageTypes?.GetValueOrDefault((page.PageIndex, type)) ?? default;
+            return stat.ExactCount - reserved.Count - (avoidFavorited ? stat.ExactFavorites : 0);
         }
 
         foreach (var page in EnumeratePlacementPages(() => EnumeratePagesWithType(type), Estimate))

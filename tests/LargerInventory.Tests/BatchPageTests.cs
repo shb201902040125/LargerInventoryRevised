@@ -21,6 +21,11 @@ internal static partial class Program
         Run(nameof(Batch_WeakPutPrefersFreeSlotsAndStableTies));
         Run(nameof(Batch_FailedPutLeavesSlotAvailableForNextCommand));
         Run(nameof(Batch_WeakTakeSkipsRepairPageAndCompletes));
+        Run(nameof(Batch_TakeReservesBeforeDelivery));
+        Run(nameof(Batch_FullyReservedSlotRejectsPutUntilNextBatch));
+        Run(nameof(Batch_TakePredicateSeesAvailableQuantityAndSelectsSlot));
+        Run(nameof(Batch_TakePredicateFailureReleasesOnlyItsReservations));
+        Run(nameof(Batch_TakeConfirmationFailureRestoresBatch));
     }
 
     private static InventoryStore CreateBatchTestStore(bool enableAggregate = true) => new(new StoreConfig
@@ -212,6 +217,149 @@ internal static partial class Program
                 "a busy candidate must be preserved and must not be marked failed");
         }
         finally { store.PageLocks.Exit(repairing.PageIndex); }
+    }
+
+    private static void Batch_TakeReservesBeforeDelivery()
+    {
+        using var store = CreateBatchTestStore();
+        var page = store.AllocatePage();
+        var slot = BatchSlot(page);
+        PumpBatch(store, CommandFactory.Put(new[] { Stack(11, 7) }, new[] { slot }));
+
+        CommandResult delivered = default;
+        var stackAtCallback = -1;
+        var take = CommandFactory.Take(11, 3, timeoutMs: BatchDeferred, callback: result =>
+        {
+            delivered = result;
+            stackAtCallback = page.Slots[0].stack;
+        });
+        var slotQuery = DeferredBatchQuery(slot);
+        var typeQuery = CommandFactory.QueryType(11);
+        PumpBatch(store, take, slotQuery, typeQuery);
+
+        Expect(slotQuery.Result.TryGetResultPayload<SlotInfo[]>(out var slots) &&
+            slots[0].Stack == 7 && slots[0].AvailableStack == 4 && !slots[0].IsAir &&
+            typeQuery.Result.TryGetResultPayload<QueryTypeResult>(out var type) && type.Count == 4,
+            "same-batch queries must show the physical stack and subtract the reserved quantity from availability");
+        Expect(take.Result.IsOk && delivered.IsOk && delivered.TryGetResultPayload<List<Item>>(out var items) &&
+            items.Count == 1 && items[0].type == 11 && items[0].stack == 3 && stackAtCallback == 4,
+            "the Take callback must receive the materialized items after the physical stack is reduced");
+    }
+
+    private static void Batch_FullyReservedSlotRejectsPutUntilNextBatch()
+    {
+        using var store = CreateBatchTestStore();
+        var page = store.AllocatePage();
+        var slot = BatchSlot(page);
+        PumpBatch(store, CommandFactory.Put(new[] { Stack(11, 4) }, new[] { slot }));
+
+        var replacement = Stack(12, 8);
+        var take = CommandFactory.Take(11, 4, timeoutMs: BatchDeferred);
+        var put = CommandFactory.Put(new[] { replacement }, new[] { slot });
+        PumpBatch(store, take, put);
+
+        Expect((put.Result.Status & CommandStatus.NoSpace) != 0 &&
+            put.Result.TryGetResultPayload<List<Item>>(out var returned) && returned.Count == 1 &&
+            ReferenceEquals(returned[0], replacement) && replacement.stack == 8,
+            "a fully reserved slot must reject a same-batch Put and return the original input");
+        Expect(take.Result.IsOk && page.Slots[0].IsAir, "confirmation must clear the fully reserved stack");
+
+        var retry = CommandFactory.Put(new[] { replacement }, new[] { slot });
+        PumpBatch(store, retry);
+        Expect(retry.Result.IsOk && ReferenceEquals(page.Slots[0], replacement),
+            "the next batch must be able to Put into the cleared slot");
+    }
+
+    private static void Batch_TakePredicateSeesAvailableQuantityAndSelectsSlot()
+    {
+        using var store = CreateBatchTestStore();
+        var page = store.AllocatePage();
+        var firstSlot = BatchSlot(page);
+        var secondSlot = BatchSlot(page, 1);
+        var seedFirst = CommandFactory.Put(new[] { Stack(11, 7) }, new[] { firstSlot }, timeoutMs: BatchDeferred);
+        var seedSecond = CommandFactory.Put(new[] { Stack(11, 5) }, new[] { secondSlot });
+        PumpBatch(store, seedFirst, seedSecond);
+
+        var observations = new List<(int Type, int Stack, int SlotId, int Available)>();
+        var first = CommandFactory.Take(11, 3, timeoutMs: BatchDeferred,
+            predicate: (_, slotId, _) => slotId == firstSlot);
+        var second = CommandFactory.Take(11, 6, timeoutMs: BatchDeferred, predicate: (item, slotId, available) =>
+        {
+            observations.Add((item.type, item.stack, slotId, available));
+            return slotId == firstSlot && item.type == 11 && available == 4;
+        });
+        PumpBatch(store, first, second, CommandFactory.Boundary());
+
+        Expect(observations.Contains((11, 7, firstSlot, 4)) && observations.Contains((11, 5, secondSlot, 5)),
+            "the predicate must see the physical item, slot ID and quantity left after the earlier Take");
+        Expect(first.Result.IsOk && first.Result.TryGetResultPayload<List<Item>>(out var firstItems) &&
+            firstItems.Count == 1 && firstItems[0].stack == 3,
+            "the first Take must deliver its reserved quantity");
+        Expect((second.Result.Status & (CommandStatus.NotEnough | CommandStatus.Partial)) ==
+            (CommandStatus.NotEnough | CommandStatus.Partial) &&
+            second.Result.TryGetResultPayload<List<Item>>(out var secondItems) && secondItems.Count == 1 &&
+            secondItems[0].stack == 4 && page.Slots[0].IsAir && page.Slots[1].stack == 5,
+            "the second Take must deliver only the available part of the selected stack and leave the rejected slot intact");
+    }
+
+    private static Command StrongBatchTake(int type, int count, int[] slots, System.Func<Item, int, int, bool> predicate = null) =>
+        new(CommandKind.Take, BatchDeferred, AccessSet.Strong(slots), new TakePayload { Type = type, Count = count, Predicate = predicate });
+
+    private static void Batch_TakePredicateFailureReleasesOnlyItsReservations()
+    {
+        using var store = CreateBatchTestStore();
+        var page = store.AllocatePage();
+        var firstSlot = BatchSlot(page);
+        var secondSlot = BatchSlot(page, 1);
+        PumpBatch(store,
+            CommandFactory.Put(new[] { Stack(11, 7) }, new[] { firstSlot }, timeoutMs: BatchDeferred),
+            CommandFactory.Put(new[] { Stack(11, 5) }, new[] { secondSlot }));
+
+        var first = StrongBatchTake(11, 3, new[] { firstSlot });
+        var failing = StrongBatchTake(11, 5, new[] { firstSlot, secondSlot },
+            predicate: (_, slot, _) => slot == firstSlot ? true : throw new System.InvalidOperationException("Predicate failed"));
+        var next = StrongBatchTake(11, 4, new[] { firstSlot });
+        PumpBatch(store, first, failing, next, CommandFactory.Boundary());
+
+        Expect(failing.Result.Status == CommandStatus.InternalError && failing.Result.ResultPayload is List<Item> { Count: 0 },
+            "the failing command must not deliver any of its tentative reservations");
+        Expect(first.Result.IsOk && next.Result.IsOk && page.Slots[0].IsAir && page.Slots[1].stack == 5,
+            "the earlier reservation must survive and the following Take must be able to reserve the remainder");
+    }
+
+    private static void Batch_TakeConfirmationFailureRestoresBatch()
+    {
+        using var store = CreateBatchTestStore();
+        var page = store.AllocatePage();
+        var firstSlot = BatchSlot(page);
+        var secondSlot = BatchSlot(page, 1);
+        var inputSlot = BatchSlot(page, 2);
+        var firstItem = Stack(11, 7);
+        var secondItem = Stack(12, 5);
+        PumpBatch(store, CommandFactory.Put(new[] { firstItem, secondItem }, new[] { firstSlot, secondSlot }));
+        var input = Stack(13, 2);
+        var put = CommandFactory.Put(new[] { input }, new[] { inputSlot }, timeoutMs: BatchDeferred);
+        var firstTake = StrongBatchTake(11, 7, new[] { firstSlot });
+        var secondTake = StrongBatchTake(12, 3, new[] { secondSlot });
+        // Trigger the real partial-stack confirmation path with a failing mod clone hook.
+        var modItemProperty = typeof(Item).GetProperty(nameof(Item.ModItem));
+        modItemProperty.SetValue(secondItem, new ThrowingCloneItem());
+        try { PumpBatch(store, put, firstTake, secondTake, CommandFactory.Boundary()); }
+        finally { modItemProperty.SetValue(secondItem, null); }
+
+        const CommandStatus failure = CommandStatus.InternalError | CommandStatus.RolledBack;
+        Expect(firstTake.Result.Status == failure && secondTake.Result.Status == failure &&
+            firstTake.Result.ResultPayload is List<Item> { Count: 0 }, "a failed split must prevent all delivery");
+        Expect(put.Result.Status == failure && put.Result.ResultPayload is List<Item> { Count: 1 } returned &&
+            ReferenceEquals(returned[0], input), "the rolled-back Put must return the original input");
+        Expect(ReferenceEquals(page.Slots[0], firstItem) && ReferenceEquals(page.Slots[1], secondItem) &&
+            page.Slots[2].IsAir, "failed confirmation must leave both original stacks and undo the earlier Put");
+    }
+
+    private sealed class ThrowingCloneItem : Terraria.ModLoader.ModItem
+    {
+        public override Terraria.ModLoader.ModItem Clone(Item newEntity) =>
+            throw new System.InvalidOperationException("Cannot clone this stack");
     }
 
     private static void Batch_FailedPutLeavesSlotAvailableForNextCommand()

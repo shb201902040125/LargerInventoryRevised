@@ -97,10 +97,10 @@ internal static partial class Program
         var jump = CommandFactory.Br(start, context =>
         {
             callbacksDuringExecution += callbacks.Count;
-            if (!context.TryGetResult(take, out var result) || !result.TryGetResultPayload<long>(out var count))
+            if (!context.TryGetResult(take, out var result) || !result.TryGetResultPayload<TakePreview>(out var preview))
                 return false;
-            observations.Add(count);
-            return count == 2;
+            observations.Add(preview.Count);
+            return preview.Count == 2;
         }, _ => callbacks.Add("branch"));
         store.PushBatch(new[] { CommandFactory.Label(start), take, jump });
 
@@ -203,15 +203,20 @@ internal static partial class Program
         var discardedTake = CommandFactory.Take(11, 3, callback: _ => callbacks.Add("discarded take"));
         var sawDiscardedTake = false;
         var restoredResults = false;
+        var slot = page.PageIndex << 10;
         var restore = CommandFactory.TransactionAction(context =>
         {
             sawDiscardedTake = context.TryGetResult(discardedTake, out var result) &&
-                result.TryGetResultPayload<long>(out var count) && count == 3;
+                result.TryGetResultPayload<TakePreview>(out var preview) && preview.Count == 3 &&
+                preview.Selections.SequenceEqual(new[] { new TakeSelection(slot, 3) });
             context.Restore(savepoint);
             restoredResults = !context.TryGetResult(discardedTake, out _) &&
-                context.TryGetResult(keptTake, out var kept) && kept.TryGetResultPayload<long>(out var keptCount) && keptCount == 2;
+                context.TryGetResult(keptTake, out var kept) && kept.TryGetResultPayload<TakePreview>(out var keptPreview) &&
+                keptPreview.Count == 2;
         });
-        var body = new[] { put, keptTake, save, discardedTake, restore };
+        var restoredSlot = CommandFactory.QuerySlot(new[] { slot });
+        var restoredType = CommandFactory.QueryType(11);
+        var body = new[] { put, keptTake, save, discardedTake, restore, restoredSlot, restoredType };
         var settledBeforePublication = false;
         CommandResult? completion = null;
         store.PushControlTransaction(body, context =>
@@ -229,6 +234,10 @@ internal static partial class Program
 
         Expect(store.Pump() > 0 && completion is { IsOk: true } && sawDiscardedTake && restoredResults && settledBeforePublication,
             "the unsplit transaction must make speculative results available and restore the checkpoint before publishing");
+        Expect(restoredSlot.Result.TryGetResultPayload<SlotInfo[]>(out var restoredSlots) &&
+            restoredSlots[0].Stack == 7 && restoredSlots[0].AvailableStack == 5 &&
+            restoredType.Result.TryGetResultPayload<QueryTypeResult>(out var restoredCount) && restoredCount.Count == 5,
+            "restoring the savepoint must release the discarded quantity while keeping the earlier reservation");
         Expect(!suffix.Done.IsSet && put.Result.IsOk && keptTake.Result.IsOk &&
             keptTake.Result.TryGetResultPayload<List<Item>>(out var keptItems) && keptItems.Sum(item => item.stack) == 2 &&
             discardedTake.Result.Status == CommandStatus.Skipped &&
@@ -251,14 +260,16 @@ internal static partial class Program
 
         var input = Stack(12, 4);
         var take = CommandFactory.Take(11, 6);
-        var put = CommandFactory.Put(new[] { input }, slots);
+        var put = CommandFactory.Put(new[] { input }, new[] { slots[0] + 1 });
         var speculativeQuery = CommandFactory.QueryType(12);
         var observedTentativeState = false;
         CommandResult? completion = null;
         store.PushControlTransaction(new[] { take, put, speculativeQuery }, context =>
         {
             observedTentativeState = context.TryGetResult(speculativeQuery, out var result) &&
-                result.TryGetResultPayload<QueryTypeResult>(out var count) && count.Count == 4;
+                result.TryGetResultPayload<QueryTypeResult>(out var count) && count.Count == 4 &&
+                context.TryGetResult(put, out var putResult) &&
+                putResult.TryGetResultPayload<PutPreview>(out var preview) && preview == new PutPreview(4, 0);
             return ControlTransactionDecision.Rollback;
         }, result => completion = result);
 
@@ -267,7 +278,7 @@ internal static partial class Program
             "rollback must settle the envelope and every body command, including the query that saw a tentative mutation");
         Expect(take.Result.TryGetResultPayload<List<Item>>(out var delivered) && delivered.Count == 0 &&
             put.Result.TryGetResultPayload<List<Item>>(out var returned) && ReferenceEquals(returned.Single(), input) &&
-            input.stack == 4 && ReferenceEquals(page.Slots[0], original) && original.stack == 6,
+            input.stack == 4 && ReferenceEquals(page.Slots[0], original) && original.stack == 6 && page.Slots[1].IsAir,
             "rollback must restore the exact original stack, suppress tentative Take output and return the original Put input");
         var originalCount = CommandFactory.QueryType(11);
         var rolledBackCount = CommandFactory.QueryType(12);

@@ -25,7 +25,7 @@ public static class InventoryTransactionExamples
             callback: completed);
     }
 
-    // 必须取足指定数量。库存不足时，即使 Take 已部分取出，也会回滚整笔事务。
+    // 必须取足指定数量。库存不足时，即使 Take 已部分预留，也会回滚整笔事务。
     // receiveItems 只会收到最终提交的物品，可以在这里转交给玩家。
     public static void WithdrawExactly(InventoryStore store, int itemType, int count,
         Action<List<Item>> receiveItems, Action<CommandResult> completed)
@@ -33,7 +33,7 @@ public static class InventoryTransactionExamples
         var take = CommandFactory.Take(itemType, count, callback: result => PassItems(result, receiveItems));
         store.PushControlTransaction(new[] { take }, settle: context =>
             Decide(context, context.TryGetResult(take, out var result) && result.IsOk &&
-                result.TryGetResultPayload<long>(out var taken) && taken == count), callback: completed);
+                result.TryGetResultPayload<TakePreview>(out var preview) && preview.Count == count), callback: completed);
     }
 
     // 先试首选槽。即使首选只移动了一部分，也先恢复源槽和目标槽，再尝试备用槽。
@@ -56,8 +56,8 @@ public static class InventoryTransactionExamples
             callback: completed);
     }
 
-    // 后跳重复取货，每轮按当前库存执行。任何一轮未取足就整笔回滚。
-    // 全部成功后，Take 的最终回调一次收到各轮保留下来的物品。
+    // 后跳重复预留，每轮只能使用尚未预留的库存。任何一轮未取足就整笔回滚。
+    // 全部成功后，Take 的最终回调一次收到各轮兑现的物品。
     public static void WithdrawInRounds(InventoryStore store, int itemType, int perRound, int rounds,
         Action<List<Item>> receiveItems, Action<CommandResult> completed)
     {
@@ -70,7 +70,7 @@ public static class InventoryTransactionExamples
         var loop = CommandFactory.Br(repeat, context =>
         {
             if (!context.TryGetResult(take, out var result) || !result.IsOk ||
-                !result.TryGetResultPayload<long>(out var taken) || taken != perRound)
+                !result.TryGetResultPayload<TakePreview>(out var preview) || preview.Count != perRound)
                 return false;
 
             completedRounds++;

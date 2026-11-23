@@ -93,7 +93,9 @@ internal static partial class Program
                 Expect(take.Result.IsOk && take.Result.TryGetResultPayload<List<Item>>(out var items) &&
                     items.Count == 2 && items.Sum(item => item.stack) == 7, "the weak take must find the moved stack too");
                 Expect(afterTake.Result.IsOk && afterTake.Result.TryGetResultPayload<SlotInfo[]>(out var slots) &&
-                    slots.All(slot => slot.IsAir), "the strong reader must see the weak removal");
+                    slots[0].IsAir && slots[1].Stack == 4 && !slots[1].IsAir &&
+                    slots[2].Stack == 3 && !slots[2].IsAir && slots.All(slot => slot.AvailableStack == 0),
+                    "the same-batch slot query must show physical stacks with their quantities reserved");
                 Expect(finalQuery.Result.IsOk && finalQuery.Result.TryGetResultPayload<QueryTypeResult>(out var final) &&
                     final.Count == 0, "the final type query must see the removal");
                 finalVersion = page.Summary.Version;

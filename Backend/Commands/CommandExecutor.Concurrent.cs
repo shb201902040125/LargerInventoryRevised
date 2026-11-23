@@ -11,11 +11,11 @@ internal sealed partial class CommandExecutor
     [ThreadStatic]
     private static CommandExecutor _workerExecutor;
 
-    private CommandResult RunOnWorker(SlotWork work)
+    private CommandResult RunOnWorker(SlotWork work, bool isolateEscape)
     {
         var previous = _workerExecutor;
         _workerExecutor = this;
-        try { return work.Run(); }
+        try { return work.Run(isolateEscape); }
         finally { _workerExecutor = previous; }
     }
 
@@ -32,7 +32,9 @@ internal sealed partial class CommandExecutor
         while (wave.Count < limit)
         {
             var command = batch[start + wave.Count];
-            if (!CanSchedule(command, slotLimit, out var readOnly) || !wave.TryAdd(command.Access.Slots, readOnly)) break;
+            if (!CanSchedule(command, slotLimit, out var readOnly) ||
+                (_reservedQuantities is { Count: > 0 } && Array.Exists(command.Access.Slots, slot => ReservedQuantity(slot) != 0)) ||
+                !wave.TryAdd(command.Access.Slots, readOnly)) break;
         }
         if (wave.Count < 2) return 0;
 
@@ -76,6 +78,7 @@ internal sealed partial class CommandExecutor
             finally { _reservedSlots.Clear(); }
         }
 
+        var isolateEscape = _controlJournal is not null;
         var tasks = new Task<CommandResult>[work.Length - 1];
         var scheduled = 0;
         CommandResult last = default;
@@ -84,10 +87,10 @@ internal sealed partial class CommandExecutor
             for (; scheduled < tasks.Length; scheduled++)
             {
                 var entry = work[scheduled];
-                tasks[scheduled] = Task.Run(() => RunOnWorker(entry));
+                tasks[scheduled] = Task.Run(() => RunOnWorker(entry, isolateEscape));
             }
             // Use the owner for one command to save a thread-pool dispatch.
-            last = work[^1].Run();
+            last = work[^1].Run(isolateEscape);
         }
         finally
         {
@@ -98,7 +101,7 @@ internal sealed partial class CommandExecutor
         {
             var result = i == tasks.Length ? last : tasks[i].Result;
             work[i].Publish(this, touchedPages);
-            work[i].Command.Complete(result);
+            CompleteBatchInstruction(work[i].Command, result);
         }
         return work.Length;
     }
@@ -112,7 +115,7 @@ internal sealed partial class CommandExecutor
             return false;
         return command.Kind switch
         {
-            CommandKind.QuerySlot or CommandKind.Take or CommandKind.Move => true,
+            CommandKind.QuerySlot or CommandKind.Move => true,
             CommandKind.Put => command.InputPayload is PutPayload { Items: { } items } && items.Count <= slotLimit,
             CommandKind.Escape => command.InputPayload is EscapePayload { Concurrent: true },
             _ => false
@@ -171,7 +174,6 @@ internal sealed partial class CommandExecutor
                 {
                     CommandKind.Escape => RunEscape((EscapePayload)Command.InputPayload, forceClone),
                     CommandKind.QuerySlot => RunQuery(),
-                    CommandKind.Take => RunTake((TakePayload)Command.InputPayload),
                     CommandKind.Put => RunPut((PutPayload)Command.InputPayload),
                     CommandKind.Move => RunMove((MovePayload)Command.InputPayload),
                     _ => CommandResult.Fail(CommandStatus.InvalidArg)
@@ -217,51 +219,6 @@ internal sealed partial class CommandExecutor
                     Stack = item.stack, Favorited = item.favorited, IsAir = item.IsAir };
             }
             return CommandResult.Ok(results);
-        }
-
-        private CommandResult RunTake(TakePayload payload)
-        {
-            var results = new List<Item>();
-            var remaining = payload.Count;
-            var all = remaining == int.MaxValue;
-            var status = CommandStatus.Ok;
-            try
-            {
-                for (var i = 0; i < Slots.Length && remaining > 0; i++)
-                {
-                    var item = Slots[i];
-                    if (item.IsAir || (payload.AvoidFavorited && item.favorited)) continue;
-                    if (item.type != payload.Type || (payload.DestinationSnapshot is not null &&
-                        !CanStackForTake(payload.DestinationSnapshot, item)))
-                    {
-                        status |= CommandStatus.TypeMismatch;
-                        continue;
-                    }
-                    var count = all ? item.stack : Math.Min(item.stack, remaining);
-                    if (count == item.stack)
-                    {
-                        Set(i, new Item());
-                        results.Add(item);
-                    }
-                    else
-                    {
-                        // Split hooks can throw after mutating the remainder. Keep the live item intact.
-                        var rest = item.Clone();
-                        results.Add(Split(rest, count));
-                        Set(i, rest);
-                    }
-                    if (!all) remaining -= count;
-                }
-            }
-            catch (Exception e)
-            {
-                Debug.Error_Internal(e);
-                status |= CommandStatus.InternalError;
-            }
-            if ((!all && remaining != 0) || results.Count == 0) status |= CommandStatus.NotEnough;
-            if (results.Count > 0 && status != CommandStatus.Ok) status |= CommandStatus.Partial;
-            _publish = true;
-            return new CommandResult(status, results);
         }
 
         private CommandResult RunPut(PutPayload payload)

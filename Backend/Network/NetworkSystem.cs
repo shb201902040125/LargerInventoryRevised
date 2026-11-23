@@ -1281,7 +1281,7 @@ public static partial class NetworkSystem
             CommandKind.QuerySlot when command.InputPayload is QuerySlotPayload slots => ValidSlots(slots.Slots, config),
             CommandKind.Move when command.InputPayload is MovePayload move => move.SourceSlot != move.DestinationSlot &&
                 ValidSlot(move.SourceSlot) && ValidSlot(move.DestinationSlot),
-            CommandKind.Take when command.InputPayload is TakePayload take => ValidType(take.Type) &&
+            CommandKind.Take when command.InputPayload is TakePayload take => take.Predicate is null && ValidType(take.Type) &&
                 take.Count > 0 && (command.Access.IsStrong
                     ? ValidSlots(command.Access.Slots, config)
                     : config is null || take.Count <= config.MaxRemoteTakeItems),

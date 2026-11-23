@@ -14,7 +14,8 @@ public static class CommandSerializer
     public static TagCompound Save(Command command)
     {
         ArgumentNullException.ThrowIfNull(command);
-        if (command.Kind is CommandKind.Escape or CommandKind.Label or CommandKind.Br or CommandKind.TransactionAction or CommandKind.ControlTransaction)
+        if (command.Kind is CommandKind.Escape or CommandKind.Label or CommandKind.Br or CommandKind.TransactionAction or CommandKind.ControlTransaction ||
+            command.InputPayload is TakePayload { Predicate: not null })
         {
             throw new NotSupportedException("Commands with local callbacks cannot be serialized.");
         }

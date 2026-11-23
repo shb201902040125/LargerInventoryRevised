@@ -138,7 +138,33 @@ public sealed class TakePayload
     public int Count;
     public bool AvoidFavorited = true;
     public Item DestinationSnapshot;
+
+    /// <summary>
+    /// 额外筛选候选槽位，参数依次为借用的 Item、槽位 ID、当前可取件数。
+    /// Item 仅在调用期间有效，禁止修改或保留引用。对借用物品的修改可能直接影响仓库，且无法保证回滚。
+    /// </summary>
+    public Func<Item, int, int, bool> Predicate { get; init; }
 }
+
+/// <summary>一次取货选中的槽位及其件数。</summary>
+public readonly record struct TakeSelection(int SlotId, int Count);
+
+/// <summary>批内一次 Take 执行的只读预览。</summary>
+public sealed class TakePreview
+{
+    public TakePreview(IEnumerable<TakeSelection> selections)
+    {
+        var snapshot = selections.ToArray();
+        Selections = Array.AsReadOnly(snapshot);
+        Count = snapshot.Sum(selection => (long)selection.Count);
+    }
+
+    public IReadOnlyList<TakeSelection> Selections { get; }
+    public long Count { get; }
+}
+
+/// <summary>批内一次 Put 执行接收与退回的件数。</summary>
+public readonly record struct PutPreview(long AcceptedCount, long ReturnedCount);
 
 public sealed class PutPayload
 {
@@ -184,6 +210,9 @@ public sealed class SlotInfo
     public int SlotId;
     public int Type;
     public int Stack;
+    private int? _availableStack;
+    /// <summary>扣除当前批次预留后的可取数量。Stack 仍表示槽位实际占用。</summary>
+    public int AvailableStack { get => _availableStack ?? Stack; internal set => _availableStack = value; }
     public bool Favorited;
     public bool IsAir;
 }
@@ -275,23 +304,32 @@ public static class CommandFactory
             new QuerySlotPayload { Slots = slots is null ? null : (int[])slots.Clone() }, callback);
     }
 
+    // 保留原有委托签名。带默认参数的调用由下方重载处理。
+    public static Command Take(int type, int count, bool avoidFavorited, int timeoutMs,
+        Action<CommandResult> callback) => Take(type, count, avoidFavorited, timeoutMs, callback, predicate: null);
+
+    /// <summary>按类型取货，可通过 <see cref="TakePayload.Predicate"/> 额外筛选候选槽位。</summary>
     public static Command Take(int type, int count, bool avoidFavorited = true, int timeoutMs = 0,
-        Action<CommandResult> callback = null)
+        Action<CommandResult> callback = null, Func<Item, int, int, bool> predicate = null)
     {
         return new Command(CommandKind.Take, timeoutMs,
             AccessSet.ForWeak(new TypeSelector(type, count, avoidFavorited)),
-            new TakePayload { Type = type, Count = count, AvoidFavorited = avoidFavorited }, callback);
+            new TakePayload { Type = type, Count = count, AvoidFavorited = avoidFavorited, Predicate = predicate }, callback);
     }
+
+    public static Command TakeCompatible(Item destinationSnapshot, int count, bool avoidFavorited,
+        int timeoutMs, Action<CommandResult> callback) =>
+        TakeCompatible(destinationSnapshot, count, avoidFavorited, timeoutMs, callback, predicate: null);
 
     /// <summary>取出与补货目标快照兼容的物品。调用方提交后不得修改该快照。</summary>
     public static Command TakeCompatible(Item destinationSnapshot, int count, bool avoidFavorited = true,
-        int timeoutMs = 0, Action<CommandResult> callback = null)
+        int timeoutMs = 0, Action<CommandResult> callback = null, Func<Item, int, int, bool> predicate = null)
     {
         var type = destinationSnapshot?.type ?? 0;
         return new Command(CommandKind.Take, timeoutMs,
             AccessSet.ForWeak(new TypeSelector(type, count, avoidFavorited)),
             new TakePayload { Type = type, Count = count, AvoidFavorited = avoidFavorited,
-                DestinationSnapshot = destinationSnapshot }, callback);
+                DestinationSnapshot = destinationSnapshot, Predicate = predicate }, callback);
     }
 
     public static Command Put(IList<Item> items, bool spill = true, int timeoutMs = 0,

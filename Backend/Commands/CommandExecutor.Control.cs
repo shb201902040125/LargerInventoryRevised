@@ -13,22 +13,24 @@ internal sealed partial class CommandExecutor
     {
         var labels = new Dictionary<BranchLabel, int>();
         var results = new Dictionary<Command, CommandResult>();
-        var outputs = new Dictionary<Command, List<Item>>();
+        Dictionary<Command, List<Item>> outputs = null;
         var savepoints = new List<(ControlSavepoint Handle, int Position,
-            Dictionary<Command, CommandResult> Results, Dictionary<Command, int> Counts)>();
+            Dictionary<Command, CommandResult> Results, int Reservations)>();
         var touched = new HashSet<int>();
         var pinned = new HashSet<int>();
         var status = CommandStatus.Ok;
         var transactional = settle is not null;
         var rolledBack = false;
-        if (transactional)
-            BeginControlJournal(touched, pinned);
+        var confirmationFailed = false;
+        var hasTake = commands.Any(command => command.Kind == CommandKind.Take);
+        if (hasTake) BeginTakeBatch(touched, pinned);
+        else if (transactional) BeginControlJournal(touched, pinned);
 
         ControlSavepoint Save()
         {
             var handle = new ControlSavepoint();
             savepoints.Add((handle, ControlJournalCheckpoint(), new(results),
-                outputs.ToDictionary(pair => pair.Key, pair => pair.Value.Count)));
+                _takeReservations?.Count ?? 0));
             return handle;
         }
 
@@ -42,13 +44,7 @@ internal sealed partial class CommandExecutor
             results.Clear();
             foreach (var pair in snapshot.Results)
                 results.Add(pair.Key, pair.Value);
-            foreach (var command in outputs.Keys.ToArray())
-            {
-                if (!snapshot.Counts.TryGetValue(command, out var count))
-                    outputs.Remove(command);
-                else
-                    outputs[command].RemoveRange(count, outputs[command].Count - count);
-            }
+            if (hasTake) RestoreReservations(snapshot.Reservations);
             savepoints.RemoveRange(index + 1, savepoints.Count - index - 1);
         }
 
@@ -105,18 +101,19 @@ internal sealed partial class CommandExecutor
                         {
                             // A successful Put consumed its input ownership. Revisiting it has no pending input.
                             if (command.Kind == CommandKind.Put && results.TryGetValue(command, out var previous) &&
-                                previous.ResultPayload is List<Item> { Count: 0 })
+                                previous.ResultPayload is ControlPutResult { Returned.Count: 0 } put && previous.IsOk)
                             {
-                                results[command] = CommandResult.Ok(previous.ResultPayload);
+                                results[command] = CommandResult.Ok(new ControlPutResult(default, put.Returned));
                                 break;
                             }
-                            var result = ExecuteControlInstruction(command, transactional, touched, pinned);
-                            if (command.Kind == CommandKind.Take && result.ResultPayload is List<Item> items)
+                            var putItems = (command.InputPayload as PutPayload)?.Items;
+                            var requested = putItems?.Sum(item => (long)(item?.stack ?? 0)) ?? 0;
+                            var result = ExecuteControlInstruction(command, transactional || hasTake, touched, pinned);
+                            if (command.Kind == CommandKind.Put)
                             {
-                                if (!outputs.TryGetValue(command, out var delivery))
-                                    outputs.Add(command, delivery = new List<Item>());
-                                delivery.AddRange(items);
-                                result = new CommandResult(result.Status, items.Sum(item => (long)item.stack));
+                                var returned = result.ResultPayload as List<Item> ?? new List<Item>();
+                                var preview = result.IsOk ? new PutPreview(requested, 0) : new PutPreview(0, requested);
+                                result = new CommandResult(result.Status, new ControlPutResult(preview, returned));
                             }
                             results[command] = result;
                             break;
@@ -149,11 +146,23 @@ internal sealed partial class CommandExecutor
                     rolledBack = true;
                 }
             }
+            if (hasTake && !rolledBack)
+            {
+                try { outputs = ConfirmReservations(touched); }
+                catch (Exception error)
+                {
+                    Debug.Error_Internal(error);
+                    status |= CommandStatus.InternalError;
+                    confirmationFailed = true;
+                    RestoreControlJournal(0);
+                    rolledBack = true;
+                }
+            }
         }
         finally
         {
-            if (transactional)
-                EndControlJournal();
+            if (hasTake) EndTakeBatch();
+            else if (transactional) EndControlJournal();
             FinishBatch(touched);
         }
 
@@ -161,13 +170,17 @@ internal sealed partial class CommandExecutor
         {
             if (rolledBack)
             {
-                command.Complete(Command.FailUnexecuted(command, CommandStatus.RolledBack));
+                var rollbackStatus = CommandStatus.RolledBack;
+                if (confirmationFailed) rollbackStatus |= CommandStatus.InternalError;
+                command.Complete(Command.FailUnexecuted(command, rollbackStatus));
                 continue;
             }
             if (!results.TryGetValue(command, out var result))
                 result = Command.FailUnexecuted(command, status == CommandStatus.Ok ? CommandStatus.Skipped : status);
-            else if (outputs.TryGetValue(command, out var delivery))
-                result = new CommandResult(result.Status, delivery);
+            else if (command.Kind == CommandKind.Take)
+                result = new CommandResult(result.Status, outputs?.GetValueOrDefault(command) ?? new List<Item>());
+            else if (result.ResultPayload is ControlPutResult put)
+                result = new CommandResult(result.Status, put.Returned);
             command.Complete(result);
         }
         if (envelope is not null)

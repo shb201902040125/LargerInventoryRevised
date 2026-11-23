@@ -37,14 +37,14 @@ public sealed class BranchContext
         _restore = restore;
     }
 
-    /// <summary>读取最近一次保留的执行结果。Take 的载荷是当次取出件数，Put 只公开状态。</summary>
+    /// <summary>读取最近一次保留的执行结果。Take 和 Put 返回只读预览。</summary>
     public bool TryGetResult(Command command, out CommandResult result)
     {
         EnsureActive();
         if (!_results.TryGetValue(command, out result))
             return false;
-        if (command.Kind == CommandKind.Put)
-            result = new CommandResult(result.Status);
+        if (result.ResultPayload is ControlPutResult put)
+            result = new CommandResult(result.Status, put.Preview);
         return true;
     }
 
@@ -68,6 +68,8 @@ public sealed class BranchContext
             throw new InvalidOperationException("The branch context is only valid during its callback.");
     }
 }
+
+internal sealed record ControlPutResult(PutPreview Preview, List<Terraria.Item> Returned);
 
 internal sealed record BranchPayload(BranchLabel Target, Func<BranchContext, bool> Predicate);
 internal sealed record ControlTransactionPayload(Command[] Commands, Func<BranchContext, ControlTransactionDecision> Settle);

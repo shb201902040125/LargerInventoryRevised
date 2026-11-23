@@ -44,6 +44,8 @@ public static class CommandResultSerializer
                 tag["slotIds"] = Array.ConvertAll(slots, s => s?.SlotId ?? -1);
                 tag["slotTypes"] = Array.ConvertAll(slots, s => s?.Type ?? 0);
                 tag["slotStacks"] = Array.ConvertAll(slots, s => s?.Stack ?? 0);
+                if (Array.Exists(slots, s => s is not null && s.AvailableStack != s.Stack))
+                    tag["slotAvailableStacks"] = Array.ConvertAll(slots, s => s?.AvailableStack ?? 0);
                 // NBT 不支持 bool[]：用 byte[] 0/1 表示。
                 tag["slotFavorited"] = Array.ConvertAll(slots, s => (byte)((s?.Favorited ?? false) ? 1 : 0));
                 tag["slotAir"] = Array.ConvertAll(slots, s => (byte)((s?.IsAir ?? true) ? 1 : 0));
@@ -110,6 +112,7 @@ public static class CommandResultSerializer
                 var ids = tag.Get<int[]>("slotIds") ?? Array.Empty<int>();
                 var types = tag.Get<int[]>("slotTypes") ?? Array.Empty<int>();
                 var stacks = tag.Get<int[]>("slotStacks") ?? Array.Empty<int>();
+                var available = tag.ContainsKey("slotAvailableStacks") ? tag.Get<int[]>("slotAvailableStacks") : Array.Empty<int>();
                 var favorites = tag.Get<byte[]>("slotFavorited") ?? Array.Empty<byte>();
                 var air = tag.Get<byte[]>("slotAir") ?? Array.Empty<byte>();
                 var slots = new SlotInfo[ids.Length];
@@ -120,6 +123,7 @@ public static class CommandResultSerializer
                         SlotId = ids[i],
                         Type = i < types.Length ? types[i] : 0,
                         Stack = i < stacks.Length ? stacks[i] : 0,
+                        AvailableStack = i < available.Length ? available[i] : i < stacks.Length ? stacks[i] : 0,
                         Favorited = i < favorites.Length && favorites[i] != 0,
                         IsAir = i < air.Length && air[i] != 0
                     };

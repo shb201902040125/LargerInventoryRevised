@@ -22,18 +22,22 @@ internal sealed class TypeIndex
 
     public bool TryGet(int type, out int count, out int favorites, out int[] pages, out bool saturated)
     {
+        var found = TryGetExact(type, out var exactCount, out var exactFavorites, out pages);
+        count = (int)Math.Min(exactCount, int.MaxValue);
+        favorites = (int)Math.Min(exactFavorites, int.MaxValue);
+        saturated = exactCount > int.MaxValue || exactFavorites > int.MaxValue;
+        return found;
+    }
+
+    internal bool TryGetExact(int type, out long count, out long favorites, out int[] pages)
+    {
         count = 0;
         favorites = 0;
-        saturated = false;
         pages = Array.Empty<int>();
-        if (!_map.TryGetValue(type, out var entry))
-        {
-            return false;
-        }
+        if (!_map.TryGetValue(type, out var entry)) return false;
 
-        count = (int)Math.Min(entry.Count, int.MaxValue);
-        favorites = (int)Math.Min(entry.Favorites, int.MaxValue);
-        saturated = entry.Count > int.MaxValue || entry.Favorites > int.MaxValue;
+        count = entry.Count;
+        favorites = entry.Favorites;
         pages = new int[entry.Pages.Count];
         entry.Pages.CopyTo(pages);
         Array.Sort(pages);
