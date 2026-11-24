@@ -12,6 +12,7 @@ internal sealed class ServerDelivery
     internal sealed record Grant(int Slot, byte[] Before, Item After);
     internal CommandStatus Status;
     internal bool Planned;
+    internal bool KeepOverflow;
     // Zero denotes a delivery that has never offered inventory grants.
     internal long Generation { get; private set; }
     internal long AdvanceGeneration() => Generation = checked(Generation + 1);
@@ -38,6 +39,7 @@ internal sealed class ServerDelivery
         {
             Status = (CommandStatus)tag.GetInt("status"), Planned = tag.GetByte("planned") != 0,
             Generation = tag.GetLong("generation"),
+            KeepOverflow = tag.GetByte("keepOverflow") != 0,
             OwnerLineage = lineage,
             RemainingCount = tag.GetInt("remainingCount"),
             Remaining = new List<Item>(tag.GetList<Item>("remaining")),
@@ -73,6 +75,7 @@ internal sealed class ServerDelivery
             ["remaining"] = forClient ? new List<Item>() : Remaining,
             ["remainingCount"] = NetworkSystem.CountItems(Remaining),
             ["generation"] = Generation,
+            ["keepOverflow"] = (byte)(KeepOverflow ? 1 : 0),
             ["ownerLineage"] = OwnerLineage.ToString("N")
         };
         if (!forClient && RecoveryItems.Count != 0)

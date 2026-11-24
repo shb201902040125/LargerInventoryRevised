@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -21,6 +22,7 @@ internal static partial class Program
         Run(nameof(Storage_AsyncPreMarkerFailureRollsBackOnOwner));
         Run(nameof(Storage_AsyncRollbackPreservesEarlierDirtyPages));
         Run(nameof(Storage_AsyncDurableLedgerFinalizesOnOwner));
+        Run(nameof(Storage_EscrowRestartProtectsSlotsAndRestoresAtomically));
         Run(nameof(Storage_PeriodicSaveSettlesOnOwner));
         Run(nameof(Storage_PeriodicSaveRefreshesMetadataThenSkipsCleanStore));
         Run(nameof(Storage_AsyncPreparationPreservesUnsupportedPageCopies));
@@ -53,6 +55,70 @@ internal static partial class Program
             Expect(recovered.LoadTransactionLedger().SequenceEqual(ledger), "replay did not restore the ledger");
             Expect(files.ReadCopy(0, false, false).Success, "replay did not retain the page");
             Expect(!Directory.Exists(Path.Combine(root, ".commit-pending")), "replay marker not retired");
+        });
+    }
+
+    private static void Storage_EscrowRestartProtectsSlotsAndRestoresAtomically()
+    {
+        WithStorageDirectory(root =>
+        {
+            var prepared = new byte[] { 31, 0 };
+            var expired = new byte[] { 32 };
+            var originals = new Dictionary<int, Terraria.Item>();
+            using (var store = new InventoryStore(new StoreConfig(), root))
+            {
+                store.Pump();
+                var page = store.AllocatePage();
+                Expect(store.FlushForSave(out var prepareError), "could not save the initial empty page: " + prepareError);
+                // The standalone harness can serialize items but cannot initialize game ItemIO for a cold read.
+                page.Slots[0] = Stack(11, 4);
+                page.Summary.RebuildFrom(page.Slots);
+                var result = new Command(CommandKind.Take, 0, AccessSet.Strong(0),
+                    new TakePayload { Type = 11, Count = 4 });
+                var committed = false;
+                Expect(store.TryExecuteTransactionAsync(result, (slot, item) => originals.Add(slot, item), commandResult =>
+                {
+                    Expect(commandResult.IsOk && originals[0].stack == 4, "encoder could not see the original stack");
+                    return prepared;
+                }, (success, _) => committed = success, out prepareError), "could not start prepared take: " + prepareError);
+                Expect(store.FlushForSave(out prepareError) && committed && page.Slots[0].IsAir,
+                    "prepared take did not commit: " + prepareError);
+            }
+
+            using var reopened = new InventoryStore(new StoreConfig(), root);
+            var restoredLedger = reopened.LoadTransactionLedger();
+            Expect(restoredLedger.SequenceEqual(prepared), "prepared ledger did not survive restart");
+            reopened.SetEscrowSlots(new[] { (int)restoredLedger[1] });
+            reopened.Pump();
+            var put = CommandFactory.Put(new[] { Stack(12, 1) }, new[] { 0 });
+            var unrelated = CommandFactory.QuerySlot(new[] { 1 });
+            reopened.PushBatch(new[] { put, unrelated });
+            reopened.Pump();
+            Expect(put.Result.Status == CommandStatus.PageBusy && unrelated.Result.IsOk,
+                "protected write must fail while an unrelated command can run");
+            Expect(!reopened.StartPageRepair(null, null, out _), "repair may overwrite a protected page");
+
+            var marker = Path.Combine(root, ".commit-pending");
+            File.WriteAllText(marker, "blocked");
+            bool? rolledBack = null;
+            Expect(reopened.TryRestoreEscrowAsync(originals, expired, (success, _) => rolledBack = !success, out var error),
+                "restore did not reach the worker: " + error);
+            Expect(SpinWait.SpinUntil(() => { reopened.Pump(); return rolledBack.HasValue; }, 5000),
+                "failed restore did not settle");
+            File.Delete(marker);
+            reopened.Pump();
+            Expect(rolledBack == true && reopened.EnsurePage(0).Slots[0].IsAir &&
+                reopened.IsEscrowSlot(0) && reopened.LoadTransactionLedger().SequenceEqual(prepared),
+                "failed restore changed escrow slots or ledger");
+
+            bool succeeded = false;
+            Expect(reopened.TryRestoreEscrowAsync(originals, expired, (success, _) => succeeded = success, out error),
+                "restore retry was rejected: " + error);
+            Expect(reopened.FlushForSave(out error) && succeeded && reopened.EnsurePage(0).Slots[0].stack == 4,
+                "restore retry did not replace the original slot: " + error);
+            Expect(File.ReadAllBytes(Path.Combine(root, StoreRedoJournal.LedgerName)).SequenceEqual(expired) &&
+                new FilePageFileStore(root).ReadCopy(0, false, false).Success,
+                "restore did not publish the page and terminal ledger");
         });
     }
 

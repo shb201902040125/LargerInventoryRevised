@@ -17,6 +17,56 @@ internal static partial class Program
         Run(nameof(NetworkDelivery_SerializesRecoveryItemsOnlyForServer));
         Run(nameof(NetworkDelivery_RejectsGenerationZeroGrants));
         Run(nameof(NetworkRecovery_DistinguishesCommittedResultsFromLookupFailures));
+        Run(nameof(NetworkEscrow_OutOfOrderCompletionPreservesEarlierPreparation));
+        Run(nameof(NetworkEscrow_BatchKeepsIndependentIdsAndRejectsDuplicates));
+        RunOperationIdTests();
+    }
+
+    private static void NetworkEscrow_BatchKeepsIndependentIdsAndRejectsDuplicates()
+    {
+        var first = Guid.NewGuid();
+        var second = Guid.NewGuid();
+        NetworkSystem.EscrowConfirmation[] Read(Guid secondRequest)
+        {
+            using var stream = new MemoryStream();
+            using var writer = new BinaryWriter(stream);
+            writer.Write(Guid.NewGuid().ToByteArray());
+            writer.Write(first.ToByteArray());
+            writer.Write(8L);
+            writer.Write(Guid.NewGuid().ToByteArray());
+            writer.Write(secondRequest.ToByteArray());
+            writer.Write(3L);
+            stream.Position = 0;
+            using var reader = new BinaryReader(stream, System.Text.Encoding.UTF8, leaveOpen: true);
+            return NetworkSystem.ReadEscrowConfirmations(reader, 2);
+        }
+        var entries = Read(second);
+        Expect(entries is { Length: 2 } && entries[0].Request == first && entries[0].Sequence == 8 &&
+            entries[1].Request == second && entries[1].Sequence == 3, "batch must preserve separate IDs and accept descending sequences");
+        Expect(Read(first) is null, "duplicate operation IDs must reject the batch");
+    }
+
+    private static void NetworkEscrow_OutOfOrderCompletionPreservesEarlierPreparation()
+    {
+        var player = Guid.NewGuid();
+        var earlier = new TransactionLedger.Key(player, Guid.NewGuid());
+        var later = new TransactionLedger.Key(player, Guid.NewGuid());
+        var lineage = Guid.NewGuid();
+        var deadline = DateTime.UtcNow.AddMinutes(1).Ticks;
+        // The standalone runner has no loaded Terraria content registry for ItemIO.Load.
+        var record = new EscrowRecord { DeadlineUtcTicks = deadline, Lineage = lineage, IsPut = true };
+        var fingerprint = NetworkSystem.CreateRequestFingerprint(NetworkSystem.Op.Put);
+        var entry = new TransactionLedger.Entry(fingerprint, false, false, record.Write(), Sequence: 1, Escrow: true);
+        var ledger = new TransactionLedger(null);
+        ledger.Publish(earlier, entry);
+        ledger.Publish(later, entry with { Sequence = 2 });
+        ledger = new TransactionLedger(ledger.Encode(later, entry with { Sequence = 2, Escrow = false, Result = new byte[] { 1 } }));
+        Expect(ledger.GetPrepared().Count == 1 && ledger.TryGet(earlier, out var preserved) && preserved.Escrow &&
+            EscrowRecord.Read(preserved.Result) is { IsPut: true, Lineage: var owner, DeadlineUtcTicks: var expires } &&
+            owner == lineage && expires == deadline, "later completion must leave the earlier escrow intact after reload");
+        Expect(!ledger.TryPrepareCompaction(player, 2, out _), "a later retirement must preserve an earlier escrow");
+        ledger.Publish(earlier, entry with { Escrow = false, Result = new byte[] { 2 } });
+        Expect(ledger.TryPrepareCompaction(player, 2, out _), "both terminal records should allow retirement");
     }
 
     private static void NetworkLedger_ReloadRejectsChangedRequests()

@@ -420,6 +420,8 @@ public sealed class InventorySystem : ModSystem
         var store = new InventoryStore(Config.Copy(), directory, scope);
         try
         {
+            if (Main.netMode == NetmodeID.Server || scope == StoreScope.World)
+                NetworkSystem.OpenEscrowStore(store);
             store.Start();
             Log.Info($"{scope} store opened: {directory}");
             return store;

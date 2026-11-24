@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
+using Terraria;
 using LargerInventory.Backend.Commands;
 using LargerInventory.Backend.Repair;
 using LargerInventory.Backend.Storage;
@@ -31,6 +32,11 @@ public sealed class InventoryStore : IDisposable
     private readonly IPageFileStore _fileStore;
     private readonly StoreRedoJournal _journal;
     private byte[] _ledger;
+    private volatile HashSet<int> _escrowSlots = new();
+
+    internal void SetEscrowSlots(IEnumerable<int> slots) => _escrowSlots = new HashSet<int>(slots);
+    internal bool HasEscrowSlots => _escrowSlots.Count != 0;
+    internal bool IsEscrowSlot(int slot) => _escrowSlots.Contains(slot);
     private volatile int _mainThreadId;
     private volatile bool _insideMainOperation;
     private bool _needsReplay;
@@ -45,6 +51,9 @@ public sealed class InventoryStore : IDisposable
     {
         public Action<bool, string> Completed { get; }
         public Command Command { get; set; }
+        public Action<int, Item> CaptureOriginalSlot { get; init; }
+        public IReadOnlyDictionary<int, Item> RestoreSlots { get; init; }
+        public byte[] RestoreLedger { get; set; }
         public Func<CommandResult, byte[]> EncodeLedger { get; set; }
         public bool RollbackOnFailure { get; set; }
         public StagedCommit Staged { get; set; }
@@ -336,6 +345,11 @@ public sealed class InventoryStore : IDisposable
             if (_disposed || _disposing || _pendingCommit is not null)
                 return false;
             EnsureReplayed();
+            if (HasEscrowSlots)
+            {
+                error = "cannot repair while escrow slots are protected";
+                return false;
+            }
             _repairService ??= new PageRepairService(this);
             return _repairService.Start(pageChanged, completed, out error);
         }
@@ -436,13 +450,33 @@ public sealed class InventoryStore : IDisposable
     internal bool TryExecuteTransactionAsync(Command command, Func<CommandResult, byte[]> encodeLedger,
         Action<bool, string> completed, out string error)
     {
+        return TryExecuteTransactionAsync(command, null, encodeLedger, completed, out error);
+    }
+
+    internal bool TryExecuteTransactionAsync(Command command, Action<int, Item> captureOriginalSlot,
+        Func<CommandResult, byte[]> encodeLedger, Action<bool, string> completed, out string error)
+    {
         ArgumentNullException.ThrowIfNull(command);
         ArgumentNullException.ThrowIfNull(encodeLedger);
-        return BeginCommitAsync(null, command, encodeLedger, completed, out error);
+        if (captureOriginalSlot is not null && command.Kind is not (CommandKind.Take or CommandKind.Put or CommandKind.Move))
+        {
+            error = "slot capture requires Take, Put or Move";
+            return false;
+        }
+        return BeginCommitAsync(null, command, encodeLedger, completed, out error, captureOriginalSlot: captureOriginalSlot);
+    }
+
+    internal bool TryRestoreEscrowAsync(IReadOnlyDictionary<int, Item> slots, byte[] ledger,
+        Action<bool, string> completed, out string error)
+    {
+        ArgumentNullException.ThrowIfNull(slots);
+        ArgumentNullException.ThrowIfNull(ledger);
+        return BeginCommitAsync(ledger, null, null, completed, out error, restoreSlots: slots);
     }
 
     private bool BeginCommitAsync(byte[] ledger, Command command, Func<CommandResult, byte[]> encodeLedger,
-        Action<bool, string> completed, out string error, bool saveOnly = false)
+        Action<bool, string> completed, out string error, bool saveOnly = false,
+        Action<int, Item> captureOriginalSlot = null, IReadOnlyDictionary<int, Item> restoreSlots = null)
     {
         ArgumentNullException.ThrowIfNull(completed);
         error = "persistent store is unavailable or busy";
@@ -452,7 +486,7 @@ public sealed class InventoryStore : IDisposable
             !_executor.TryAcquireForSave(0))
             return false;
 
-        var pending = new PendingCommit(completed);
+        PendingCommit pending = null;
         try
         {
             if (IsPreparing)
@@ -472,17 +506,27 @@ public sealed class InventoryStore : IDisposable
 
             _mainThreadId = Environment.CurrentManagedThreadId;
             _insideMainOperation = true;
+            pending = new PendingCommit(completed)
+            {
+                CaptureOriginalSlot = captureOriginalSlot,
+                RestoreSlots = restoreSlots is null ? null : CopyEscrowSlots(restoreSlots)
+            };
             _pendingCommit = pending;
-            if (command is not null && (PageCache.HasDirtyPages || _needsReplay))
+            if ((command is not null || restoreSlots is not null) && (PageCache.HasDirtyPages || _needsReplay))
             {
                 // Do not let a later rollback discard work already acknowledged to ordinary callers.
                 pending.Command = command;
                 pending.EncodeLedger = encodeLedger;
+                pending.RestoreLedger = restoreSlots is null ? null : (byte[])ledger.Clone();
                 StartDiskCommit(pending, null);
             }
             else if (command is not null)
             {
                 StartTransactionCommit(pending, command, encodeLedger);
+            }
+            else if (restoreSlots is not null)
+            {
+                StartEscrowRestore(pending, ledger);
             }
             else
             {
@@ -507,8 +551,51 @@ public sealed class InventoryStore : IDisposable
     private void StartTransactionCommit(PendingCommit pending, Command command, Func<CommandResult, byte[]> encodeLedger)
     {
         pending.RollbackOnFailure = true;
-        var result = _executor.ExecuteTransactionCommand(command);
+        var result = _executor.ExecuteTransactionCommand(command, pending.CaptureOriginalSlot);
         StartDiskCommit(pending, encodeLedger(result) ?? throw new InvalidOperationException("Transaction ledger was not encoded."));
+    }
+
+    private Dictionary<int, Item> CopyEscrowSlots(IReadOnlyDictionary<int, Item> slots)
+    {
+        var copy = new Dictionary<int, Item>(slots.Count);
+        foreach (var (slot, item) in slots)
+        {
+            if (slot < 0 || !IsEscrowSlot(slot) || item is null)
+                throw new InvalidOperationException($"Slot {slot} is not a valid protected escrow slot.");
+            copy.Add(slot, item.IsAir ? new Item() : item.Clone());
+        }
+        return copy;
+    }
+
+    private void StartEscrowRestore(PendingCommit pending, byte[] ledger)
+    {
+        var pages = new Dictionary<int, ItemPage>();
+        var locked = new HashSet<int>();
+        try
+        {
+            foreach (var slot in pending.RestoreSlots.Keys)
+            {
+                var index = slot / ItemPage.SlotCount;
+                if (!IsEscrowSlot(slot) || !PageCache.Directory.Contains(index))
+                    throw new InvalidOperationException($"Escrow slot {slot} is no longer available for restoration.");
+                if (pages.ContainsKey(index)) continue;
+                if (!PageLocks.TryEnterUse(index))
+                    throw new InvalidOperationException($"Escrow page {index} is busy.");
+                locked.Add(index);
+                pages.Add(index, EnsurePage(index));
+            }
+
+            pending.RollbackOnFailure = true;
+            foreach (var (slot, item) in pending.RestoreSlots)
+                pages[slot / ItemPage.SlotCount].Slots[slot % ItemPage.SlotCount] = item;
+            SyncSummaries(locked);
+            StartDiskCommit(pending, ledger);
+        }
+        finally
+        {
+            foreach (var index in locked)
+                PageLocks.ExitUse(index);
+        }
     }
 
     private void StartDiskCommit(PendingCommit pending, byte[] ledger)
@@ -545,6 +632,13 @@ public sealed class InventoryStore : IDisposable
                 ApplyCommit(pending.Staged, durable.Published);
                 durable.ReportDiagnostics();
 
+                if (pending.RestoreLedger is { } restoreLedger)
+                {
+                    EnsureReplayed();
+                    pending.RestoreLedger = null;
+                    StartEscrowRestore(pending, restoreLedger);
+                    continue;
+                }
                 if (pending.Command is not { } command)
                     break;
 
@@ -583,7 +677,7 @@ public sealed class InventoryStore : IDisposable
     private string HandleCommitFailure(PendingCommit pending, Exception failure)
     {
         var error = failure.Message;
-        if (pending.RollbackOnFailure)
+        if (pending?.RollbackOnFailure == true)
         {
             try { ReloadCommittedPages(); }
             catch (Exception rollbackError)
@@ -764,6 +858,7 @@ public sealed class InventoryStore : IDisposable
 
     internal void CommitRepairPage(int index, byte[] contents, PageSummary summary, bool deleteBackup)
     {
+        if (HasEscrowSlots) throw new InvalidOperationException("Cannot repair while escrow slots are protected.");
         EnsureReplayed();
         var page = PageCache.Directory.GetOrCreate(index);
         var previous = new PageSummary();
@@ -1021,6 +1116,12 @@ public sealed class InventoryStore : IDisposable
             {
                 if (!SettlePendingCommit(Config.FlushLockTimeoutMs, out notify, out error))
                     return false;
+                // The completion callback may publish new escrow locks. Dispatch it before draining writes.
+                if (notify is not null && Queue.Count > 0)
+                {
+                    error = "store transaction finalized; retry close after its completion callback";
+                    return false;
+                }
                 _repairService?.Dispose();
                 _repairService = null;
                 if (IsMainThread || Integration.InventorySystem.Instance is null)

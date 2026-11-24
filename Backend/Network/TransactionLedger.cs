@@ -8,6 +8,9 @@ namespace LargerInventory.Backend.Network;
 internal sealed class TransactionLedger
 {
     private const int Version = 4;
+    private const byte PlainResult = 0;
+    private const byte ServerDeliveryResult = 1;
+    private const byte PreparedEscrowResult = 2;
     internal const int FingerprintLength = 32;
     private const int HeaderBytes = sizeof(int) * 3;
     private const int EntryBytes = 16 + 16 + FingerprintLength + 1 + 1 + 1 + sizeof(int);
@@ -18,7 +21,7 @@ internal sealed class TransactionLedger
 
     internal readonly record struct Key(Guid Player, Guid Request);
     internal sealed record Entry(byte[] Fingerprint, bool Deliver, bool Acknowledged, byte[] Result,
-        long? Sequence = null)
+        long? Sequence = null, bool Escrow = false)
     {
         internal bool Matches(byte[] fingerprint) => Fingerprint is not null && fingerprint is not null &&
             Fingerprint.AsSpan().SequenceEqual(fingerprint);
@@ -117,7 +120,8 @@ internal sealed class TransactionLedger
 
             var deliver = reader.ReadBoolean();
             var acknowledged = reader.ReadBoolean();
-            var serverDelivery = reader.ReadBoolean();
+            var resultKind = reader.ReadByte();
+            var escrow = resultKind == PreparedEscrowResult;
             var length = reader.ReadInt32();
             long? sequence = null;
             // Version 4 uses a negative result length to mark the optional sequence before the result.
@@ -133,14 +137,15 @@ internal sealed class TransactionLedger
                 _highestSequences[key.Player] = Math.Max(GetHighestSequence(key.Player), sequence.Value);
             }
 
-            if (key.Player == Guid.Empty || key.Request == Guid.Empty || (acknowledged && !deliver) || deliver != serverDelivery ||
+            if (key.Player == Guid.Empty || key.Request == Guid.Empty || (acknowledged && !deliver) ||
+                resultKind > PreparedEscrowResult || deliver != (resultKind == ServerDeliveryResult) ||
                 length <= 0 || length > NetworkSystem.MaxResultBytes ||
                 length > reader.BaseStream.Length - reader.BaseStream.Position)
             {
                 throw new InvalidDataException("Invalid transaction ledger entry.");
             }
 
-            if (!_entries.TryAdd(key, new Entry(fingerprint, deliver, acknowledged, reader.ReadBytes(length), sequence)))
+            if (!_entries.TryAdd(key, new Entry(fingerprint, deliver, acknowledged, reader.ReadBytes(length), sequence, escrow)))
             {
                 throw new InvalidDataException("Duplicate transaction ledger entry.");
             }
@@ -156,6 +161,17 @@ internal sealed class TransactionLedger
 
     // GUID-only recovery and receipts may read retained entries. Mutation resends must use Lookup.
     internal bool TryGet(Key key, out Entry entry) => _entries.TryGetValue(key, out entry);
+
+    internal List<(Key Key, Entry Entry)> GetPrepared()
+    {
+        var prepared = new List<(Key Key, Entry Entry)>();
+        foreach (var pair in _entries)
+        {
+            if (pair.Value.Escrow)
+                prepared.Add((pair.Key, pair.Value));
+        }
+        return prepared;
+    }
 
     internal bool HasPendingDelivery(Guid player, Guid exceptRequest = default)
     {
@@ -250,7 +266,7 @@ internal sealed class TransactionLedger
     }
 
     // The caller supplies an authenticated cumulative client acknowledgement: results through this sequence can
-    // be forgotten. A pending delivery blocks retirement even if the client claims to be done with its result.
+    // be forgotten. Pending deliveries and prepared escrow block retirement.
     // Serialize prepare, durable commit of Contents as-is, and Publish with ALL other ledger writes for this store.
     internal bool TryPrepareCompaction(Guid player, long acknowledgedThrough, out Compaction compaction)
     {
@@ -273,7 +289,7 @@ internal sealed class TransactionLedger
                 continue;
             }
 
-            if (IsPendingDelivery(entry))
+            if (entry.Escrow || IsPendingDelivery(entry))
             {
                 return false;
             }
@@ -325,7 +341,7 @@ internal sealed class TransactionLedger
     private (int Length, bool Replacing) ProjectEntry(Key key, Entry entry)
     {
         if (entry is null || entry.Fingerprint?.Length != FingerprintLength ||
-            entry.Acknowledged && !entry.Deliver || entry.Result is null ||
+            entry.Acknowledged && !entry.Deliver || entry.Escrow && entry.Deliver || entry.Result is null ||
             entry.Result.Length <= 0 || entry.Result.Length > NetworkSystem.MaxResultBytes)
         {
             throw new InvalidDataException("Invalid transaction ledger entry.");
@@ -383,7 +399,8 @@ internal sealed class TransactionLedger
         writer.Write(entry.Fingerprint);
         writer.Write(entry.Deliver);
         writer.Write(entry.Acknowledged);
-        writer.Write(entry.Deliver); // The v4 server-delivery marker is required for all deliveries.
+        // Codes 0 and 1 preserve the v4 boolean marker for existing entries.
+        writer.Write(entry.Escrow ? PreparedEscrowResult : entry.Deliver ? ServerDeliveryResult : PlainResult);
         writer.Write(entry.Sequence.HasValue ? -entry.Result.Length : entry.Result.Length);
         if (entry.Sequence is long sequence)
         {

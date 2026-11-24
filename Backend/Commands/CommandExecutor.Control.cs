@@ -200,6 +200,9 @@ internal sealed partial class CommandExecutor
         _pageLoadFailedHit = false;
         try
         {
+            if (command.Kind is CommandKind.Take or CommandKind.Put or CommandKind.Move or CommandKind.Escape &&
+                command.Access.IsStrong && _store.HasEscrowSlots && Array.Exists(command.Access.Slots, _store.IsEscrowSlot))
+                return Command.FailUnexecuted(command, CommandStatus.PageBusy);
             if (command.Access.IsStrong && !TryReserveStrongSlots(command.Access))
                 return Command.FailUnexecuted(command, CommandStatus.PageBusy);
             if (touched.Count != 0 && !command.Access.IsStrong && command.Kind != CommandKind.NopBoundary)

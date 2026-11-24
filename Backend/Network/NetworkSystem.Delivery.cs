@@ -84,7 +84,7 @@ public static partial class NetworkSystem
         if (!IsCurrent(session))
             return;
         void Reply(CommandResult result, bool completed = false) => QueueResult(session, scope, correlation, request,
-            completed && entry.Sequence.HasValue ? CompletedOperationFlag : (byte)0, Encode(result));
+            completed ? CompletedOperationFlag : (byte)0, Encode(result));
         void ReplyLatest(bool success)
         {
             if (!IsCurrent(session))
@@ -119,29 +119,20 @@ public static partial class NetworkSystem
             return;
         }
 
-        if (!state.Planned)
+        if (!state.Planned || (state.KeepOverflow && state.Grants.Count == 0 && state.Remaining.Count != 0))
         {
             if (session.OfferedDeliveries.Count != 0)
             {
                 Reply(CommandResult.Fail(CommandStatus.PendingDelivery));
                 return;
             }
-            var inventory = (Item[])player.inventory.Clone();
-            var overflow = new List<Item>();
-            PlayerItemDelivery.GiveToInventory(inventory, state.Remaining.ConvertAll(item => item.Clone()), overflow);
-            var end = Main.InventoryItemSlotsStart + Main.InventoryItemSlotsCount;
-            for (var slot = Main.InventoryItemSlotsStart; slot < end; slot++)
+            var remainingCount = CountItems(state.Remaining);
+            var overflow = PlanDelivery(player, state);
+            if (state.KeepOverflow && (state.Grants.Count == 0 || overflow.Count != 0))
             {
-                if (!ReferenceEquals(inventory[slot], player.inventory[slot]))
-                    state.Grants.Add(new ServerDelivery.Grant(slot, ServerDelivery.Snapshot(player.inventory[slot]), inventory[slot]));
+                Reply(new CommandResult(state.Status | CommandStatus.PendingDelivery | CommandStatus.NoSpace, remainingCount));
+                return;
             }
-            if (state.Grants.Count != 0)
-            {
-                state.AdvanceGeneration();
-                state.RecoveryItems = state.Remaining;
-            }
-            state.Planned = true;
-            state.Remaining = overflow;
             SaveDeliveryAsync(store, ledger, key, entry, state, ReplyLatest);
             return;
         }
@@ -178,12 +169,40 @@ public static partial class NetworkSystem
         Reply(new CommandResult(state.Status | CommandStatus.PendingDelivery | CommandStatus.NoSpace, CountItems(state.Remaining)));
     }
 
+    private static List<Item> PlanDelivery(Player player, ServerDelivery state)
+    {
+        var inventory = (Item[])player.inventory.Clone();
+        var overflow = new List<Item>();
+        PlayerItemDelivery.GiveToInventory(inventory, state.Remaining.ConvertAll(item => item.Clone()), overflow);
+        var end = Main.InventoryItemSlotsStart + Main.InventoryItemSlotsCount;
+        for (var slot = Main.InventoryItemSlotsStart; slot < end; slot++)
+        {
+            if (!ReferenceEquals(inventory[slot], player.inventory[slot]))
+                state.Grants.Add(new ServerDelivery.Grant(slot, ServerDelivery.Snapshot(player.inventory[slot]), inventory[slot]));
+        }
+        if (state.Grants.Count != 0)
+        {
+            state.AdvanceGeneration();
+            state.RecoveryItems = state.Remaining;
+        }
+        state.Planned = true;
+        state.Remaining = overflow;
+        return overflow;
+    }
+
     private static void OfferGrant(Session session, InventoryStore store, Scope scope, Guid correlation,
         TransactionLedger.Key key, ServerDelivery state)
     {
+        if (Outgoing.Count >= RuntimeConfig.MaxNetworkTransfers || session.CommittingTake ||
+            (session.OfferedDeliveries.Count != 0 && !session.OfferedDeliveries.Contains((store, key.Request))))
+        {
+            QueueResult(session, scope, correlation, key.Request, 0, Encode(CommandResult.Fail(CommandStatus.PendingDelivery)));
+            return;
+        }
+        var bytes = state.Write(forClient: true);
         DeliveryOwners[(store, key)] = session;
         session.OfferedDeliveries.Add((store, key.Request));
-        QueueResult(session, scope, correlation, key.Request, GrantFlag, state.Write(forClient: true));
+        QueueResult(session, scope, correlation, key.Request, GrantFlag, bytes);
     }
 
     private static void Acknowledge(Session session, InventoryStore store, Guid request, Guid correlation, long generation)

@@ -13,10 +13,12 @@ using Terraria.ModLoader.IO;
 
 namespace LargerInventory.Backend.Network;
 
-/// <summary>Versioned, connection-bound access to the authoritative stores. Item input is server-side only.</summary>
+/// <summary>Versioned, connection-bound access to authoritative stores and item escrow.</summary>
 public static partial class NetworkSystem
 {
-    public const byte ProtocolVersion = 7;
+    public const byte ProtocolVersion = 8;
+    private const byte PreparedFlag = 32;
+    private const int MaxUploadBytes = 24 * 1024;
     internal const byte GrantFlag = 8;
     internal const byte CompletedOperationFlag = 16;
     internal const int MaxResultBytes = 4 * 1024 * 1024;
@@ -26,7 +28,7 @@ public static partial class NetworkSystem
 
     private static StoreConfig RuntimeConfig => StoreConfig.Runtime;
 
-    internal enum Op : byte { Hello = 1, Welcome, Read, Mutate, Put, DebugFill, Lookup, Receipt, Result, Trusted = 12, Retire, RejectGrant }
+    internal enum Op : byte { Hello = 1, Welcome, Read, Mutate, Put, DebugFill, Lookup, Receipt, Result, Trusted = 12, Retire, RejectGrant, Consume, PreparePut, ConsumeBatch }
     private enum Scope : byte { Player, World }
 
     private sealed class Session
@@ -41,6 +43,9 @@ public static partial class NetworkSystem
         public int Revision;
         public Player ConnectionPlayer;
         public readonly Dictionary<(Scope Scope, Guid Request), Source> Sources = new();
+        public readonly Dictionary<(Scope Scope, Guid Request), byte[]> PutUploads = new();
+        public readonly Queue<QueuedConfirmation> Confirmations = new();
+        public bool CommittingTake;
         public readonly HashSet<(InventoryStore Store, Guid Request)> OfferedDeliveries = new();
         public readonly Dictionary<(InventoryStore Store, Guid Request), Guid> SentDeliveries = new();
     }
@@ -181,6 +186,9 @@ public static partial class NetworkSystem
             return requestId;
         }
 
+        if (command.Kind == CommandKind.Take)
+            return PrepareTake(scope, command, callback, requestId, autoConsume: true, reportPreview: false);
+
         var op = command.Kind is CommandKind.QuerySlot or CommandKind.QueryType ? Op.Read : Op.Mutate;
         // Freeze the small scalar request before a handshake or retry can defer sending it.
         using var bytes = new MemoryStream();
@@ -210,9 +218,10 @@ public static partial class NetworkSystem
             return request;
         }
 
-        if (request == Guid.Empty)
+        if (request == Guid.Empty && !TryCreateClientOperationId(scope, recoverable, out request))
         {
-            request = recoverable ? NewRecoverableId() : Guid.NewGuid();
+            Invoke(callback, CommandResult.Fail(CommandStatus.Preparing));
+            return request;
         }
 
         if (Requests.Count >= RuntimeConfig.MaxPendingNetworkRequests)
@@ -299,7 +308,10 @@ public static partial class NetworkSystem
             return () => Bind(slot, revision, playerId);
         }
 
-        if (op is not (Op.Read or Op.Mutate or Op.Put or Op.DebugFill or Op.Lookup or Op.Receipt or Op.Retire or Op.RejectGrant))
+        if (op == Op.ConsumeBatch)
+            return ReadConsumeBatch(reader, slot);
+
+        if (op is not (Op.Read or Op.Mutate or Op.Put or Op.DebugFill or Op.Lookup or Op.Receipt or Op.Retire or Op.RejectGrant or Op.Consume or Op.PreparePut))
         {
             return null;
         }
@@ -328,6 +340,14 @@ public static partial class NetworkSystem
             count = reader.ReadInt32();
         }
 
+        byte[] upload = null;
+        if (op == Op.PreparePut)
+        {
+            var length = reader.ReadInt32();
+            if (length <= 0 || length > MaxUploadBytes) return null;
+            upload = reader.ReadBytes(length);
+            if (upload.Length != length) return null;
+        }
         var generation = op is Op.Receipt or Op.RejectGrant ? reader.ReadInt64() : 0L;
         return () =>
         {
@@ -336,7 +356,7 @@ public static partial class NetworkSystem
                 return;
             }
 
-            HandleRequest(session, scope, correlation, request, op, command, type, count, sequence, lineage, generation);
+            HandleRequest(session, scope, correlation, request, op, command, type, count, sequence, lineage, generation, upload);
         };
     }
 
@@ -371,7 +391,7 @@ public static partial class NetworkSystem
         var flags = reader.ReadByte();
         var total = reader.ReadInt32();
         var offset = reader.ReadInt32();
-        if (flags is not (0 or GrantFlag or CompletedOperationFlag) || total <= 0 || total > MaxResultBytes ||
+        if (flags is not (0 or GrantFlag or CompletedOperationFlag or PreparedFlag) || total <= 0 || total > MaxResultBytes ||
             offset < 0 || offset >= total || offset % FrameBytes != 0)
         {
             return null;
@@ -480,7 +500,7 @@ public static partial class NetworkSystem
         ArgumentNullException.ThrowIfNull(reserve);
         ArgumentNullException.ThrowIfNull(settle);
         if (request == Guid.Empty || !Sessions.TryGetValue(slot, out var session) || !IsCurrent(session) ||
-            session.Sources.Count >= RuntimeConfig.MaxPendingNetworkRequests)
+            session.Sources.Count >= RuntimeConfig.MaxPendingNetworkRequests || session.PutUploads.ContainsKey((scope, request)))
         {
             return false;
         }
@@ -533,7 +553,7 @@ public static partial class NetworkSystem
     }
 
     private static void HandleRequest(Session session, Scope scope, Guid correlation, Guid request, Op op,
-        Command command, int type, int count, long sequence, Guid lineage, long generation)
+        Command command, int type, int count, long sequence, Guid lineage, long generation, byte[] upload)
     {
         var store = scope == Scope.World ? session.WorldStore : session.PlayerStore;
         if (lineage != Guid.Empty)
@@ -583,6 +603,16 @@ public static partial class NetworkSystem
         if (_transactionRunning || store.IsBusy)
         {
             Reply(CommandResult.Fail(store.IsPreparing ? CommandStatus.Preparing : CommandStatus.PageBusy));
+            return;
+        }
+        if (op == Op.Consume)
+        {
+            ConsumeEscrow(session, store, scope, correlation, request, sequence);
+            return;
+        }
+        if (op == Op.PreparePut)
+        {
+            PrepareUploadedPut(session, store, scope, correlation, request, sequence, upload);
             return;
         }
         if (op == Op.RejectGrant)
@@ -644,7 +674,8 @@ public static partial class NetworkSystem
             return;
         }
 
-        if (op != Op.Put && session.Sources.ContainsKey((scope, request)))
+        if (session.PutUploads.ContainsKey((scope, request)) ||
+            op != Op.Put && session.Sources.ContainsKey((scope, request)))
         {
             Reply(CommandResult.Fail(CommandStatus.InvalidArg));
             return;
@@ -653,12 +684,6 @@ public static partial class NetworkSystem
         if (command?.Kind == CommandKind.Take && lineage == Guid.Empty)
         {
             Reply(CommandResult.Fail(CommandStatus.Preparing));
-            return;
-        }
-
-        if (command?.Kind == CommandKind.Take && HasPendingTake(session, store, request))
-        {
-            Reply(CommandResult.Fail(CommandStatus.PageBusy));
             return;
         }
 
@@ -696,18 +721,29 @@ public static partial class NetworkSystem
     private static void ReplyEntry(Session session, InventoryStore store, Scope scope, Guid correlation, Guid request,
         TransactionLedger.Entry entry)
     {
+        if (entry.Escrow)
+        {
+            ReplyPrepared(session, store, scope, correlation, request, entry);
+            return;
+        }
         if (entry.Deliver)
         {
             ReplyServerDelivery(session, store, scope, correlation, request, entry);
             return;
         }
 
-        byte flags = entry.Sequence.HasValue ? CompletedOperationFlag : (byte)0;
-        QueueResult(session, scope, correlation, request, flags, entry.Result);
+        QueueResult(session, scope, correlation, request, CompletedOperationFlag, entry.Result);
     }
 
     private static TransactionLedger GetLedger(InventoryStore store) =>
-        _ledgers.GetValue(store, value => new TransactionLedger(value.LoadTransactionLedger(), value.Config));
+        _ledgers.GetValue(store, value =>
+        {
+            var ledger = new TransactionLedger(value.LoadTransactionLedger(), value.Config);
+            RefreshEscrowLocks(value, ledger);
+            return ledger;
+        });
+
+    internal static void OpenEscrowStore(InventoryStore store) => GetLedger(store);
 
     private static TransactionLedger.Entry Execute(Session session, InventoryStore store, Guid request,
         byte[] fingerprint, Func<Command> create, out CommandResult failure)
@@ -884,6 +920,11 @@ public static partial class NetworkSystem
         }
 
         Requests.Remove(correlation);
+        if (flags == PreparedFlag)
+        {
+            HandleEscrowPrepared(pending, pending.Bytes);
+            return;
+        }
         CommandResult result;
         try
         {
@@ -913,6 +954,7 @@ public static partial class NetworkSystem
             result = CommandResult.Fail(CommandStatus.InternalError);
         }
 
+        ObserveEscrowClientResult(pending, pending.Flags, result);
         AdvanceClientRecovery(pending, result, pending.Flags);
         Invoke(pending.Callback, result);
     }
@@ -973,16 +1015,21 @@ public static partial class NetworkSystem
         if (Main.netMode == NetmodeID.Server)
         {
             PruneSessions();
+            PumpConsumeBatches();
+            PumpEscrowExpiry();
             PumpTransfers();
             return;
         }
 
         if (Main.netMode != NetmodeID.MultiplayerClient)
         {
+            if (Main.netMode == NetmodeID.SinglePlayer)
+                PumpEscrowExpiry();
             return;
         }
 
         var now = Environment.TickCount64;
+        PumpEscrowClient(now);
         PumpClientRecovery(now);
         if (_client is null && _clientPlayer != Guid.Empty && now - _helloSent >= config.NetworkHelloRetryMs)
         {
@@ -1051,6 +1098,7 @@ public static partial class NetworkSystem
     // Called by the main-thread store lifecycle after updating sessions and draining transfers.
     internal static bool CanClosePlayerStore(InventoryStore store)
     {
+        if (EscrowStores.ContainsKey(store)) return false;
         foreach (var session in Sessions.Values)
         {
             if (ReferenceEquals(session.PlayerStore, store) && IsCurrent(session))
@@ -1092,6 +1140,8 @@ public static partial class NetworkSystem
         }
 
         Sessions.Clear();
+        EscrowStores.Clear();
+        ResetEscrowClient();
         DeliveryOwners.Clear();
         PendingDropSaves.Clear();
         Outgoing.Clear();
@@ -1281,10 +1331,10 @@ public static partial class NetworkSystem
             CommandKind.QuerySlot when command.InputPayload is QuerySlotPayload slots => ValidSlots(slots.Slots, config),
             CommandKind.Move when command.InputPayload is MovePayload move => move.SourceSlot != move.DestinationSlot &&
                 ValidSlot(move.SourceSlot) && ValidSlot(move.DestinationSlot),
-            CommandKind.Take when command.InputPayload is TakePayload take => take.Predicate is null && ValidType(take.Type) &&
-                take.Count > 0 && (command.Access.IsStrong
-                    ? ValidSlots(command.Access.Slots, config)
-                    : config is null || take.Count <= config.MaxRemoteTakeItems),
+            CommandKind.Take when command.InputPayload is TakePayload take =>
+                take.Predicate is null && take.DestinationSnapshot is null && ValidType(take.Type) &&
+                take.Count > 0 && (config is null || take.Count <= config.MaxRemoteTakeItems) &&
+                (!command.Access.IsStrong || ValidSlots(command.Access.Slots, config)),
             CommandKind.Put when config is not null && command.InputPayload is PutPayload put =>
                 ValidPut(put, config.MaxRemotePutStacks) && (!command.Access.IsStrong || ValidSlots(command.Access.Slots, config)),
             _ => false

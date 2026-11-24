@@ -16,10 +16,16 @@ public static partial class NetworkSystem
 
     private static void OpenClientRecovery(Session session, long playerHigh, long worldHigh)
     {
+        ResetEscrowClient();
         _clientJournal = null;
         _playerHigh = playerHigh;
         _worldHigh = worldHigh;
         _nextRecovery = 0;
+        TryOpenClientJournal(session);
+    }
+
+    private static void TryOpenClientJournal(Session session)
+    {
         var file = Main.ActivePlayerFileData;
         if (file is not null && ClientOperationJournal.TryOpen(Main.SavePath, session.Player, session.World,
                 file.Path, file.IsCloudSave, out var journal))
@@ -29,10 +35,19 @@ public static partial class NetworkSystem
         }
     }
 
+    private static bool TryGetJournalSequence(Scope scope, Guid request, out long sequence)
+    {
+        sequence = 0;
+        if (_clientJournal is null || !_clientJournal.TryGet(request, out var entry) || entry.Scope != JournalScope(scope))
+            return false;
+        sequence = entry.Sequence;
+        return true;
+    }
+
     private static bool StageRecoverableRequest(Scope scope, Guid request, out long sequence)
     {
         sequence = 0;
-        if (_clientJournal is null || _clientJournal.GetPending().Any(entry => entry.Scope == JournalScope(scope)))
+        if (_clientJournal is null)
             return false;
         if (!_clientJournal.TryStage(JournalScope(scope), request, scope == Scope.World ? _worldHigh : _playerHigh, out var entry))
             return false;
@@ -43,22 +58,27 @@ public static partial class NetworkSystem
     private static void PumpClientRecovery(long now)
     {
         var config = RuntimeConfig;
-        if (_clientJournal is null || now < _nextRecovery || Requests.Count >= config.MaxPendingNetworkRequests)
+        if (_client is null || now < _nextRecovery || Requests.Count >= config.MaxPendingNetworkRequests)
             return;
         _nextRecovery = now + config.NetworkRecoveryRetryMs;
+        if (_clientJournal is null)
+            TryOpenClientJournal(_client);
+        if (_clientJournal is null)
+            return;
         foreach (var entry in _clientJournal.GetPending())
         {
-            if (Requests.Values.Any(pending => pending.Request == entry.OperationId))
-                continue;
+            if (Requests.Count >= config.MaxPendingNetworkRequests)
+                break;
             var scope = entry.Scope == StoreScope.World ? Scope.World : Scope.Player;
-            StartRequest(scope, Op.Lookup, entry.OperationId, null, sequence: entry.Sequence);
+            if (!HasPendingEscrowRequest(scope, entry.OperationId))
+                StartRequest(scope, Op.Lookup, entry.OperationId, null, sequence: entry.Sequence);
         }
     }
 
     private static void AdvanceClientRecovery(Pending pending, CommandResult result, byte flags)
     {
         if (pending.Sequence <= 0 || _clientJournal is null || !_clientJournal.TryGet(pending.Request, out var entry) ||
-            entry.Sequence != pending.Sequence)
+            entry.Scope != JournalScope(pending.Scope) || entry.Sequence != pending.Sequence)
             return;
         switch (GetRecoveryAction(pending.Operation, result.Status, flags))
         {
@@ -70,7 +90,9 @@ public static partial class NetworkSystem
                 _clientJournal.TryConfirmRetired(entry);
                 break;
             case RecoveryAction.Retire:
-                StartRequest(pending.Scope, Op.Retire, pending.Request, null, sequence: pending.Sequence);
+                // The server's retirement floor is cumulative. Keep earlier local results recoverable.
+                if (!_clientJournal.GetPending().Any(older => older.Scope == entry.Scope && older.Sequence < entry.Sequence))
+                    StartRequest(pending.Scope, Op.Retire, pending.Request, null, sequence: pending.Sequence);
                 break;
         }
     }
@@ -80,7 +102,7 @@ public static partial class NetworkSystem
     internal static RecoveryAction GetRecoveryAction(Op operation, CommandStatus status, byte flags)
     {
         if (flags == CompletedOperationFlag)
-            return status != CommandStatus.InternalError && operation is Op.Lookup or Op.Mutate or Op.Put or Op.DebugFill
+            return status != CommandStatus.InternalError && operation is Op.Lookup or Op.Mutate or Op.Put or Op.DebugFill or Op.Consume
                 ? RecoveryAction.Retire : RecoveryAction.Retry;
         if (flags == 0 && status == CommandStatus.Retired)
             return RecoveryAction.ForgetRetired;

@@ -17,7 +17,7 @@ public sealed class InventoryDebugCommand : ModCommand
 {
     public override CommandType Type => CommandType.Chat;
     public override string Command => "li";
-    public override string Usage => "/li fill <type> <count> | take <type> <count> | q <type> | slot <slotId> | move <srcSlot> <dstSlot> | stats | repair [world|status|cancel] | pause [on|off] | netq <type> [world] | netfill <type> <count> | nettake <type> <count> | netmove <srcSlot> <dstSlot> | netresult <operation-id> | netcollect <operation-id>";
+    public override string Usage => "/li fill <type> <count> | take <type> <count> | q <type> | slot <slotId> | move <srcSlot> <dstSlot> | stats | repair [world|status|cancel] | pause [on|off] | netq <type> [world] | netfill <type> <count> | nettake <type> <count> [manual] | netmove <srcSlot> <dstSlot> | netresult <operation-id> | netcollect <operation-id> [operation-id ...]";
     public override string Description => "LargerInventory test command (requires config).";
 
     public override void Action(CommandCaller caller, string input, string[] args)
@@ -342,7 +342,29 @@ public sealed class InventoryDebugCommand : ModCommand
                 return;
             }
 
-            if (sub is "netresult" or "netcollect")
+            if (sub == "netcollect")
+            {
+                if (args.Length < 2 || args.Length > NetworkSystem.MaxEscrowConfirmationBatch + 1)
+                {
+                    caller.Reply("Usage: /li netcollect <operation-id> [operation-id ...]");
+                    return;
+                }
+                var ids = new List<Guid>(args.Length - 1);
+                for (int index = 1; index < args.Length; index++)
+                {
+                    if (!Guid.TryParse(args[index], out var id) || id == Guid.Empty || ids.Contains(id))
+                    {
+                        caller.Reply("Provide distinct operation IDs.");
+                        return;
+                    }
+                    ids.Add(id);
+                }
+                NetworkSystem.ConsumeWorldEscrows(ids, (id, result) =>
+                    Main.NewText($"[LI][net] {id:N} {result.Status} (remaining={result.ResultPayload})"));
+                return;
+            }
+
+            if (sub == "netresult")
             {
                 if (args.Length != 2 || !Guid.TryParse(args[1], out var id) || id == Guid.Empty)
                 {
@@ -376,6 +398,8 @@ public sealed class InventoryDebugCommand : ModCommand
             var request = sub switch
             {
                 "netfill" => NetworkSystem.RequestRecoverableDebugFill(itemType, count, ReplyNetworkResult),
+                "nettake" when args.Length > 3 && args[3].Equals("manual", StringComparison.OrdinalIgnoreCase) =>
+                    NetworkSystem.PrepareWorldTake(CommandFactory.Take(itemType, count, true), ReplyNetworkResult),
                 "nettake" => NetworkSystem.RequestRecoverableWorldTransaction(CommandFactory.Take(itemType, count, true), ReplyNetworkResult),
                 _ => Guid.Empty
             };

@@ -37,6 +37,8 @@ internal sealed partial class CommandExecutor
 
     private void BeforeSlotWrite(ItemPage page, int slot)
     {
+        var original = page.Slots[slot];
+        _capturedOriginalSlots?.TryAdd((page.PageIndex << 10) | slot, original);
         if (_controlJournal is not { } journal) return;
 
         // Journaled commands replace slot references. Escape publishes detached items

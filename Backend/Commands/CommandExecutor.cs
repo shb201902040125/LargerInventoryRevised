@@ -159,7 +159,9 @@ internal sealed partial class CommandExecutor
         }
     }
 
-    internal CommandResult ExecuteTransactionCommand(Command command)
+    private Dictionary<int, Item> _capturedOriginalSlots;
+
+    internal CommandResult ExecuteTransactionCommand(Command command, Action<int, Item> captureOriginalSlot = null)
     {
         if (command.Kind is CommandKind.Label or CommandKind.Br or CommandKind.TransactionAction or CommandKind.ControlTransaction)
             return Command.FailUnexecuted(command, CommandStatus.InvalidArg);
@@ -175,13 +177,20 @@ internal sealed partial class CommandExecutor
         }
 
         _executingThreadId = Environment.CurrentManagedThreadId;
+        _capturedOriginalSlots = captureOriginalSlot is null ? null : new();
         try
         {
             ExecuteBatch(new List<Command> { command }, notify: false);
+            if (_capturedOriginalSlots is not null)
+                foreach (var (slot, item) in _capturedOriginalSlots)
+                    if (_store.PageCache.Directory.TryGet(PageOf(slot), out var page) && page.Loaded &&
+                        !ReferenceEquals(page.Slots[SlotOf(slot)], item))
+                        captureOriginalSlot(slot, item.IsAir ? new Item() : item.Clone());
             return command.Result;
         }
         finally
         {
+            _capturedOriginalSlots = null;
             _executingThreadId = 0;
         }
     }
@@ -572,7 +581,7 @@ internal sealed partial class CommandExecutor
             var item = page.Slots[SlotOf(slotId)];
             result[i].Type = item.type;
             result[i].Stack = item.stack;
-            result[i].AvailableStack = item.IsAir ? 0 : item.stack - ReservedQuantity(slotId);
+            result[i].AvailableStack = item.IsAir || _store.IsEscrowSlot(slotId) ? 0 : item.stack - ReservedQuantity(slotId);
             result[i].Favorited = item.favorited;
             result[i].IsAir = item.IsAir;
         }
@@ -596,7 +605,7 @@ internal sealed partial class CommandExecutor
                 if (item.IsAir || (payload.AvoidFavorited && item.favorited)) continue;
                 var slotId = (page.PageIndex << 10) | index;
                 var available = item.stack - ReservedQuantity(slotId);
-                if (available <= 0) continue;
+                if (available <= 0 || _store.IsEscrowSlot(slotId)) continue;
                 if (item.type != payload.Type || (payload.DestinationSnapshot is not null &&
                     !CanStackForTake(payload.DestinationSnapshot, item)))
                 {
@@ -652,7 +661,7 @@ internal sealed partial class CommandExecutor
 
                 void MergeInto(ItemPage page, int slot)
                 {
-                    if (ReservedQuantity((page.PageIndex << 10) | slot) != 0) return;
+                    if (ReservedQuantity((page.PageIndex << 10) | slot) != 0 || _store.IsEscrowSlot((page.PageIndex << 10) | slot)) return;
                     var destination = page.Slots[slot];
                     if (destination.IsAir) return;
                     if (destination.type != source.type)
@@ -677,7 +686,7 @@ internal sealed partial class CommandExecutor
 
                 void FillEmpty(ItemPage page, int slot)
                 {
-                    if (!page.Slots[slot].IsAir) return;
+                    if (!page.Slots[slot].IsAir || _store.IsEscrowSlot((page.PageIndex << 10) | slot)) return;
                     if (source.stack <= source.maxStack)
                     {
                         Place(page, slot, source);
@@ -901,7 +910,7 @@ internal sealed partial class CommandExecutor
             var item = page.Slots[slot];
             if (!item.IsAir)
             {
-                if (ReservedQuantity((page.PageIndex << 10) | slot) != 0)
+                if (ReservedQuantity((page.PageIndex << 10) | slot) != 0 || _store.IsEscrowSlot((page.PageIndex << 10) | slot))
                     return CommandResult.Fail(CommandStatus.PageBusy);
                 ReserveSlot(page, slot, pinnedPages);
                 if (isolateItems)

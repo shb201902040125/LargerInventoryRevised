@@ -9,25 +9,6 @@ namespace LargerInventory.Backend.Network;
 
 public static partial class NetworkSystem
 {
-    // The UUID namespace distinguishes compactable operation IDs from the GUID-only API.
-    private static ReadOnlySpan<byte> RecoveryNamespace => "LIORDv6!"u8;
-
-    private static Guid NewRecoverableId()
-    {
-        var bytes = Guid.NewGuid().ToByteArray();
-        RecoveryNamespace.CopyTo(bytes);
-        return new Guid(bytes);
-    }
-
-    private static bool IsRecoverableId(Guid id) => id.ToByteArray().AsSpan(0, 8).SequenceEqual(RecoveryNamespace);
-
-    private static bool HasPendingTake(Session session, InventoryStore store, Guid request)
-    {
-        var other = ReferenceEquals(store, session.WorldStore) ? session.PlayerStore : session.WorldStore;
-        return GetLedger(store).HasPendingDelivery(session.Player, request) ||
-            other is not null && (other.IsBusy || GetLedger(other).HasPendingDelivery(session.Player));
-    }
-
     private static void ExecuteAsync(Session session, InventoryStore store, Guid request, long sequence,
         byte[] fingerprint, Func<Command> create, Action<TransactionLedger.Entry, CommandResult> completed)
     {
@@ -63,23 +44,27 @@ public static partial class NetworkSystem
             }
 
             var executable = new Command(reserved.Kind, 0, reserved.Access, payload);
-            if (store.TryExecuteTransactionAsync(executable, result =>
+            var originals = executable.Kind == CommandKind.Take ? new Dictionary<int, Item>() : null;
+            Action<int, Item> capture = originals is null ? null : (slot, item) => originals.TryAdd(slot, item);
+            if (store.TryExecuteTransactionAsync(executable, capture, result =>
                 {
                     if ((result.Status & (CommandStatus.InternalError | CommandStatus.PageSaveFailed)) != 0)
                         throw new InvalidDataException("Command did not complete safely.");
                     var delivery = executable.Kind == CommandKind.Take && result.ResultPayload is List<Item> { Count: > 0 };
                     committedResult = result;
                     var encoded = delivery
-                        ? new ServerDelivery
+                        ? new EscrowRecord
                         {
+                            DeadlineUtcTicks = DateTime.UtcNow.AddMilliseconds(store.Config.NetworkRequestTimeoutMs).Ticks,
                             Status = result.Status,
-                            Remaining = (List<Item>)result.ResultPayload,
-                            OwnerLineage = session.JournalLineage
+                            Items = (List<Item>)result.ResultPayload,
+                            OriginalSlots = originals,
+                            Lineage = session.JournalLineage
                         }.Write()
-                        : Encode(executable.Kind == CommandKind.Put
+                        : Encode(executable.Kind is CommandKind.Put or CommandKind.Take
                             ? new CommandResult(result.Status, CountItems(result.ResultPayload as List<Item>)) : result);
-                    entry = new TransactionLedger.Entry(fingerprint, delivery, false, encoded,
-                        Sequence: sequence > 0 ? sequence : null);
+                    entry = new TransactionLedger.Entry(fingerprint, false, false, encoded,
+                        Sequence: sequence > 0 ? sequence : null, Escrow: delivery);
                     return ledger.Encode(key, entry);
                 }, (success, failure) =>
                 {
@@ -90,6 +75,7 @@ public static partial class NetworkSystem
                         return;
                     }
                     ledger.Publish(key, entry);
+                    if (entry.Escrow) RefreshEscrowLocks(store, ledger);
                     completed(entry, originalItems is not null && committedResult.ResultPayload is List<Item> { Count: > 0 }
                         ? new CommandResult(committedResult.Status, originalItems) : committedResult);
                 }, out error))

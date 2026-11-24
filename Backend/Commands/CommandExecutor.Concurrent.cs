@@ -34,6 +34,7 @@ internal sealed partial class CommandExecutor
             var command = batch[start + wave.Count];
             if (!CanSchedule(command, slotLimit, out var readOnly) ||
                 (_reservedQuantities is { Count: > 0 } && Array.Exists(command.Access.Slots, slot => ReservedQuantity(slot) != 0)) ||
+                (_store.HasEscrowSlots && Array.Exists(command.Access.Slots, _store.IsEscrowSlot)) ||
                 !wave.TryAdd(command.Access.Slots, readOnly)) break;
         }
         if (wave.Count < 2) return 0;
