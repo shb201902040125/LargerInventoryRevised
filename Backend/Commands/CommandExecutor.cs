@@ -358,7 +358,7 @@ internal sealed partial class CommandExecutor
             CommandKind.NopBoundary => !access.IsStrong && command.InputPayload is null,
             CommandKind.QueryType => !access.IsStrong && command.InputPayload is QueryTypePayload query && query.Type > 0,
             CommandKind.QuerySlot => access.IsStrong && command.InputPayload is QuerySlotPayload query &&
-                query.Slots is not null && slots.SequenceEqual(query.Slots),
+                query.Slots is not null && slots.AsSpan().SequenceEqual(query.Slots),
             CommandKind.Take => command.InputPayload is TakePayload take && take.Type > 0 && take.Count > 0 &&
                 (take.DestinationSnapshot is null || (!take.DestinationSnapshot.IsAir && take.DestinationSnapshot.type == take.Type)),
             CommandKind.Put => command.InputPayload is PutPayload put && put.Items is not null &&
@@ -373,9 +373,7 @@ internal sealed partial class CommandExecutor
 
         if (valid && access.IsStrong)
         {
-            valid = slots.Length > 0 && slots.Distinct().Count() == slots.Length &&
-                slots.All(slot => slot >= 0 && PageOf(slot) < PageDirectory.MaxPageCount &&
-                    _store.PageCache.Directory.Contains(PageOf(slot)));
+            valid = ValidateStrongSlots(slots);
         }
 
         failure = default;
@@ -386,6 +384,27 @@ internal sealed partial class CommandExecutor
                 : Command.FailUnexecuted(command, CommandStatus.InvalidArg);
         }
         return valid;
+    }
+
+    private bool ValidateStrongSlots(int[] slots)
+    {
+        if (slots.Length == 0) return false;
+
+        // The common small access sets need no heap allocation. Larger sets stay linear.
+        var seen = slots.Length > 8 ? new HashSet<int>(slots.Length) : null;
+        int previousPage = -1;
+        for (int index = 0; index < slots.Length; index++)
+        {
+            int slot = slots[index];
+            int page = PageOf(slot);
+            if (slot < 0 || page >= PageDirectory.MaxPageCount ||
+                (page != previousPage && !_store.PageCache.Directory.Contains(page)))
+                return false;
+            previousPage = page;
+            if (seen is null ? slots.AsSpan(0, index).Contains(slot) : !seen.Add(slot))
+                return false;
+        }
+        return true;
     }
 
     private static void CompleteAndNotify(Command command, CommandResult result)

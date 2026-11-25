@@ -34,7 +34,43 @@ public sealed class InventoryStore : IDisposable
     private byte[] _ledger;
     private volatile HashSet<int> _escrowSlots = new();
 
-    internal void SetEscrowSlots(IEnumerable<int> slots) => _escrowSlots = new HashSet<int>(slots);
+    private IReadOnlyDictionary<int, long> _escrowLockedCounts = new Dictionary<int, long>();
+
+    internal void SetEscrowSlots(IEnumerable<int> slots, IReadOnlyDictionary<int, long> lockedCounts = null)
+    {
+        _escrowSlots = new HashSet<int>(slots);
+        _escrowLockedCounts = lockedCounts ?? new Dictionary<int, long>();
+    }
+
+    internal CommandStatus TryCaptureAvailableTypeCounts(out Dictionary<int, long> counts)
+    {
+        counts = null;
+        if (_disposed || _disposing)
+            return CommandStatus.Cancelled;
+        if (IsBusy || !_executor.TryAcquireForSave(0))
+            return IsPreparing ? CommandStatus.Preparing : CommandStatus.PageBusy;
+
+        try
+        {
+            if (IsBusy)
+                return IsPreparing ? CommandStatus.Preparing : CommandStatus.PageBusy;
+
+            counts = TypeIndex.CopyCounts();
+            foreach (var (type, locked) in _escrowLockedCounts)
+            {
+                var available = counts.GetValueOrDefault(type) - locked;
+                if (available > 0)
+                    counts[type] = available;
+                else
+                    counts.Remove(type);
+            }
+            return CommandStatus.Ok;
+        }
+        finally
+        {
+            _executor.ReleaseAfterSave();
+        }
+    }
     internal bool HasEscrowSlots => _escrowSlots.Count != 0;
     internal bool IsEscrowSlot(int slot) => _escrowSlots.Contains(slot);
     private volatile int _mainThreadId;
@@ -962,6 +998,8 @@ public sealed class InventoryStore : IDisposable
         PageCache.MarkDirty(page);
     }
 
+    private readonly Dictionary<int, TypeStat> _previousSummaryTypes = new();
+
     /// <summary>重算受影响页的摘要，并更新全局类型聚合。</summary>
     internal void SyncSummaries(HashSet<int> affectedPages)
     {
@@ -972,15 +1010,21 @@ public sealed class InventoryStore : IDisposable
                 continue;
             }
 
-            var before = page.Summary.SnapshotTypes();
+            var aggregate = Config.EnableGlobalAggregate;
+            if (aggregate)
+            {
+                _previousSummaryTypes.Clear();
+                foreach (var (type, stat) in page.Summary.Types)
+                    _previousSummaryTypes.Add(type, stat);
+            }
             page.Summary.RebuildFrom(page.Slots);
             page.Summary.Version++;
             page.KnownNonEmpty = page.Summary.OccupiedStacks > 0;
             PageCache.MarkDirty(page);
 
-            if (Config.EnableGlobalAggregate)
+            if (aggregate)
             {
-                TypeIndex.UpdatePage(pageIndex, before, page.Summary.Types);
+                TypeIndex.UpdatePage(pageIndex, _previousSummaryTypes, page.Summary.Types);
             }
         }
     }

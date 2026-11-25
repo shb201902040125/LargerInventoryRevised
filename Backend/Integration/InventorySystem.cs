@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using LargerInventory.Backend.Commands;
+using LargerInventory.Backend.Crafting;
 using LargerInventory.Backend.Network;
 using LargerInventory.Backend.Storage;
 using Terraria;
@@ -97,6 +98,7 @@ public sealed class InventorySystem : ModSystem
         On_Main.ErasePlayer -= OnErasePlayer;
         On_Main.EraseWorld -= OnEraseWorld;
         CloseWorld();
+        CraftingQueries.Unload();
         Instance = null;
     }
 
@@ -336,7 +338,9 @@ public sealed class InventorySystem : ModSystem
             }
         }
 
+        CraftingQueries.SetupCatalog();
         NetworkSystem.Update();
+        CraftingQueries.Pump();
         DrainMainThreadActions();
         if (Main.netMode == NetmodeID.SinglePlayer)
         {
@@ -488,6 +492,7 @@ public sealed class InventorySystem : ModSystem
     private void CloseWorld()
     {
         NetworkSystem.CancelAll();
+        CraftingQueries.CancelQueries();
         lock (_storesGate)
         {
             foreach (var store in GetOpenStores())

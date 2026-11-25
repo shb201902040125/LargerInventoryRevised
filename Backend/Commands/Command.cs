@@ -35,7 +35,8 @@ public enum CommandStatus
     Retired = 1 << 19,
     Skipped = 1 << 20,
     ControlFlowLimit = 1 << 21,
-    RolledBack = 1 << 22
+    RolledBack = 1 << 22,
+    RecipeTableMismatch = 1 << 23
 
     // TIMEOUT 不属于执行器状态：接入层自行等待时由接入层定义。
 }

@@ -19,12 +19,29 @@ dotnet run --project tests/LargerInventory.Tests
 - `Auto pickup` 和 `Auto refill` 分别默认关闭，当前在单机使用。自动拾取先走原版背包拾取，仓库只接收余量。消耗补货按目标槽的实际缺口补充，跳过仓中收藏的物品。
 - 单机取出的物品先进入背包，再尝试掉落在世界。暂时无法交付的物品保存在角色待交付列表中。
 - `/li` 由默认关闭的 `Enable test commands` 控制，多人时以服务器配置为准。单机可测试 `fill`、`take`、`q`、`slot`、`move`、`stats`、`repair`、`pause`。多人服务器禁止修复及暂停。
-- 多人使用同版协议。已入场的角色用持久 UUID 绑定世界中的个人仓。同世界、同 UUID 的连接共享一个实例。世界仓对已入场玩家开放读写。
-- 多人测试命令包括 `/li netq <type> [world]`、`/li netfill <type> <count>`、`/li netmove <srcSlot> <dstSlot>`、`/li nettake <type> <count>` 和 `/li netresult <operation-id>`。普通 Put 由服务端事务来源提供物品。仓库无法容纳整笔存入时，服务器拒绝请求，全部物品归还原来源。共享世界仓通过显式请求存入。`netfill` 是独立的调试入口。联机取出由服务器安排背包交付，背包放不下的部分由服务器在玩家附近掉落。
+- 多人客户端和服务端均需使用协议 v9。已入场的角色用持久 UUID 绑定世界中的个人仓。同世界、同 UUID 的连接共享一个实例。世界仓对已入场玩家开放读写。
+- 多人测试命令包括 `/li netq <type> [world]`、`/li netfill <type> <count>`、`/li netmove <srcSlot> <dstSlot>`、`/li nettake <type> <count>` 和 `/li netresult <operation-id>`。普通 Put 由服务端事务来源提供物品。仓库无法容纳整笔存入时，来源保留或收回全部物品。共享世界仓通过显式请求存入。`netfill` 是独立的调试入口。
+- 联机取出先把物品持久化托管，再按操作 ID 确认并交付。确认时背包须能容纳整笔取货，未确认到期时物品恢复到原槽。旧账本中已提交的交付按原记录恢复。
+
+## 可用合成查询
+
+启用测试命令后，用 `/li recipes` 查询当前角色的个人仓，用 `/li recipes -world` 查询世界仓。每个配方根据所选仓库的可用材料独立判断能否合成一次。C# 接口 `CraftingQueries.QueryAvailableRecipes` 返回按 `RecipeIndex` 查询的候选位图。
+
+联机由服务端判定材料和条件。入服时校验配方表的数量与按序指纹，校验失败只禁用该连接的合成查询。结果反映查询当时的仓库和环境。需要精确判断时，请在同一指令组内检查物品实例并预留材料。条件支持范围见 [后端实现说明](<Backend/IMPLEMENTATION.md#可用合成查询>)。
 
 ## 指令接入
 
 单机和服务端的 C# 调用方式见 [指令示例](<docs/InventoryCommandExamples.cs>)，包含放入、取出、查询、批量入队与边界。优化优先级和验收方法见 [性能优化方案](<docs/Performance-Optimization.md>)。
+
+## 性能基准
+
+```powershell
+dotnet build LargerInventory.csproj -p:BuildMod=false -p:TargetFramework=net8.0 -p:LangVersion=12.0 -p:Optimize=true
+dotnet run --project tests/LargerInventory.Tests -c Release -- --benchmark-crafting
+dotnet run --project tests/LargerInventory.Tests -c Release -- --benchmark-waves
+```
+
+配方基准测量材料判定。仓库基准测量内存仓的批量提交和 `Pump`，覆盖移动、借用型逃逸与克隆型逃逸。逃逸回调只返回成功，完成回调使用空函数，计时包含回调调用开销。
 
 ## 存档与修复
 

@@ -44,6 +44,14 @@ internal sealed class TypeIndex
         return true;
     }
 
+    internal Dictionary<int, long> CopyCounts()
+    {
+        var counts = new Dictionary<int, long>(_map.Count);
+        foreach (var (type, entry) in _map)
+            counts.Add(type, entry.Count);
+        return counts;
+    }
+
     public bool HasType(int type) => _map.ContainsKey(type);
 
     public void UpdatePage(int pageIndex, Dictionary<int, TypeStat> before, Dictionary<int, TypeStat> after)

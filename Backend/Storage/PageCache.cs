@@ -191,12 +191,19 @@ internal sealed class PageCache
         }
 
         var now = NowMs();
-        var loaded = _directory.Allocated.Where(p => p.Loaded).ToList();
-        var remainingLoaded = loaded.Count;
-
-        foreach (var page in loaded)
+        var pages = _directory.Allocated;
+        var remainingLoaded = 0;
+        for (var index = 0; index < pages.Count; index++)
         {
-            if (page.PinCount > 0)
+            if (pages[index].Loaded)
+                remainingLoaded++;
+        }
+
+        // Releasing slots leaves the directory intact, so eviction can keep its existing order.
+        for (var index = 0; index < pages.Count; index++)
+        {
+            var page = pages[index];
+            if (!page.Loaded || page.PinCount > 0)
             {
                 continue;
             }

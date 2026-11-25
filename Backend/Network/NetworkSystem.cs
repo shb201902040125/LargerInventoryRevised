@@ -16,7 +16,7 @@ namespace LargerInventory.Backend.Network;
 /// <summary>Versioned, connection-bound access to authoritative stores and item escrow.</summary>
 public static partial class NetworkSystem
 {
-    public const byte ProtocolVersion = 8;
+    public const byte ProtocolVersion = 9;
     private const byte PreparedFlag = 32;
     private const int MaxUploadBytes = 24 * 1024;
     internal const byte GrantFlag = 8;
@@ -28,7 +28,7 @@ public static partial class NetworkSystem
 
     private static StoreConfig RuntimeConfig => StoreConfig.Runtime;
 
-    internal enum Op : byte { Hello = 1, Welcome, Read, Mutate, Put, DebugFill, Lookup, Receipt, Result, Trusted = 12, Retire, RejectGrant, Consume, PreparePut, ConsumeBatch }
+    internal enum Op : byte { Hello = 1, Welcome, Read, Mutate, Put, DebugFill, Lookup, Receipt, Result, Trusted = 12, Retire, RejectGrant, Consume, PreparePut, ConsumeBatch, AvailableRecipes }
     private enum Scope : byte { Player, World }
 
     private sealed class Session
@@ -42,6 +42,10 @@ public static partial class NetworkSystem
         public InventoryStore WorldStore;
         public int Revision;
         public Player ConnectionPlayer;
+        public Crafting.RecipeCatalog JoinedRecipeCatalog;
+        public Crafting.RecipeCatalog CalibratedRecipes;
+        public long NextRecipeQuery;
+        public long NextRecipeThrottleReply;
         public readonly Dictionary<(Scope Scope, Guid Request), Source> Sources = new();
         public readonly Dictionary<(Scope Scope, Guid Request), byte[]> PutUploads = new();
         public readonly Queue<QueuedConfirmation> Confirmations = new();
@@ -104,13 +108,20 @@ public static partial class NetworkSystem
         }
 
         _clientPlayer = playerId;
-        WriteHello();
+        // The game's first update finalizes the local recipe catalog before sending Hello.
+        _helloSent = Environment.TickCount64 - RuntimeConfig.NetworkHelloRetryMs;
     }
 
     private static void WriteHello()
     {
+        if (!_sentRecipeHello)
+        {
+            _helloRecipeCatalog = Crafting.CraftingQueries.Catalog;
+            _sentRecipeHello = true;
+        }
         var packet = NewPacket(Op.Hello);
         WriteGuid(packet, _clientPlayer);
+        WriteRecipeTable(packet, _helloRecipeCatalog);
         packet.Send();
         _helloSent = Environment.TickCount64;
     }
@@ -305,13 +316,14 @@ public static partial class NetworkSystem
         if (op == Op.Hello)
         {
             var playerId = ReadGuid(reader);
-            return () => Bind(slot, revision, playerId);
+            var recipes = ReadRecipeTable(reader);
+            return () => Bind(slot, revision, playerId, recipes);
         }
 
         if (op == Op.ConsumeBatch)
             return ReadConsumeBatch(reader, slot);
 
-        if (op is not (Op.Read or Op.Mutate or Op.Put or Op.DebugFill or Op.Lookup or Op.Receipt or Op.Retire or Op.RejectGrant or Op.Consume or Op.PreparePut))
+        if (op is not (Op.Read or Op.Mutate or Op.Put or Op.DebugFill or Op.Lookup or Op.Receipt or Op.Retire or Op.RejectGrant or Op.Consume or Op.PreparePut or Op.AvailableRecipes))
         {
             return null;
         }
@@ -356,6 +368,13 @@ public static partial class NetworkSystem
                 return;
             }
 
+            if (op == Op.AvailableRecipes)
+            {
+                if (sequence == 0)
+                    HandleRecipeQuery(session, scope, correlation, request);
+                return;
+            }
+
             HandleRequest(session, scope, correlation, request, op, command, type, count, sequence, lineage, generation, upload);
         };
     }
@@ -369,11 +388,18 @@ public static partial class NetworkSystem
             var token = ReadGuid(reader);
             var playerHigh = reader.ReadInt64();
             var worldHigh = reader.ReadInt64();
+            var recipes = ReadRecipeTable(reader);
+            var recipesAccepted = reader.ReadBoolean();
             return () =>
             {
                 if (player == _clientPlayer && player != Guid.Empty && world != Guid.Empty && token != Guid.Empty && _client is null)
                 {
-                    _client = new Session { Player = player, World = world, Token = token };
+                    var catalog = _helloRecipeCatalog;
+                    _client = new Session
+                    {
+                        Player = player, World = world, Token = token,
+                        CalibratedRecipes = recipesAccepted && RecipeTableMatches(catalog, recipes) ? catalog : null
+                    };
                     OpenClientRecovery(_client, playerHigh, worldHigh);
                 }
             };
@@ -391,7 +417,8 @@ public static partial class NetworkSystem
         var flags = reader.ReadByte();
         var total = reader.ReadInt32();
         var offset = reader.ReadInt32();
-        if (flags is not (0 or GrantFlag or CompletedOperationFlag or PreparedFlag) || total <= 0 || total > MaxResultBytes ||
+        if (flags is not (0 or GrantFlag or CompletedOperationFlag or PreparedFlag or RecipeAvailabilityFlag) ||
+            total <= 0 || total > (flags == RecipeAvailabilityFlag ? MaxRecipeResultBytes : MaxResultBytes) ||
             offset < 0 || offset >= total || offset % FrameBytes != 0)
         {
             return null;
@@ -436,7 +463,7 @@ public static partial class NetworkSystem
         }
     }
 
-    private static void Bind(int slot, int revision, Guid playerId)
+    private static void Bind(int slot, int revision, Guid playerId, RecipeTableStamp recipes)
     {
         var system = InventorySystem.Instance;
         if (playerId == Guid.Empty || system?.WorldStore is null || system.WorldId == Guid.Empty ||
@@ -453,11 +480,13 @@ public static partial class NetworkSystem
             }
 
             RemoveSession(slot);
+            var catalog = Crafting.CraftingQueries.Catalog;
             session = new Session
             {
                 Slot = slot, Player = playerId, World = system.WorldId, Token = Guid.NewGuid(),
                 PlayerStore = playerStore, WorldStore = system.WorldStore, Revision = revision,
-                ConnectionPlayer = Main.player[slot]
+                ConnectionPlayer = Main.player[slot], JoinedRecipeCatalog = catalog,
+                CalibratedRecipes = RecipeTableMatches(catalog, recipes) ? catalog : null
             };
             Sessions[slot] = session;
         }
@@ -470,6 +499,8 @@ public static partial class NetworkSystem
             WriteGuid(packet, session.Token);
             packet.Write(GetLedger(session.PlayerStore).GetHighestSequence(session.Player));
             packet.Write(GetLedger(session.WorldStore).GetHighestSequence(session.Player));
+            WriteRecipeTable(packet, session.JoinedRecipeCatalog);
+            packet.Write(HasCalibratedRecipes(session));
             packet.Send(slot);
         }
     }
@@ -896,7 +927,8 @@ public static partial class NetworkSystem
     {
         var session = _client;
         if (session is null || session.Token != token || !Requests.TryGetValue(correlation, out var pending) ||
-            scope != pending.Scope || request != pending.Request || offset != pending.Offset)
+            scope != pending.Scope || request != pending.Request || offset != pending.Offset ||
+            (flags == RecipeAvailabilityFlag) != (pending.Operation == Op.AvailableRecipes))
         {
             return;
         }
@@ -920,6 +952,11 @@ public static partial class NetworkSystem
         }
 
         Requests.Remove(correlation);
+        if (flags == RecipeAvailabilityFlag)
+        {
+            Invoke(pending.Callback, DecodeRecipeAvailability(session, pending.Bytes));
+            return;
+        }
         if (flags == PreparedFlag)
         {
             HandleEscrowPrepared(pending, pending.Bytes);
@@ -1147,6 +1184,9 @@ public static partial class NetworkSystem
         Outgoing.Clear();
         _ledgers = new ConditionalWeakTable<InventoryStore, TransactionLedger>();
         _client = null;
+        _sentRecipeHello = false;
+        _helloRecipeCatalog = null;
+        ActiveRecipeQueries.Clear();
         _clientJournal = null;
         _clientPlayer = Guid.Empty;
         var cancelled = new List<Pending>(Requests.Values);

@@ -1,5 +1,6 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using Terraria;
 using Terraria.ModLoader.Default;
 
@@ -81,26 +82,22 @@ internal sealed class PageSummary
                 var key = unloaded.FullName;
                 SlotTypes[i] = -1;
                 SlotUnloadedKeys[i] = key;
-                UnloadedTypes.TryGetValue(key, out var unloadedStat);
+                ref var unloadedStat = ref CollectionsMarshal.GetValueRefOrAddDefault(UnloadedTypes, key, out _);
                 unloadedStat.ExactCount += item.stack;
                 if (item.favorited)
                 {
                     unloadedStat.ExactFavorites++;
                 }
-
-                UnloadedTypes[key] = unloadedStat;
                 continue;
             }
 
             SlotTypes[i] = item.type;
-            Types.TryGetValue(item.type, out var stat);
+            ref var stat = ref CollectionsMarshal.GetValueRefOrAddDefault(Types, item.type, out _);
             stat.ExactCount += item.stack;
             if (item.favorited)
             {
                 stat.ExactFavorites++;
             }
-
-            Types[item.type] = stat;
         }
     }
 

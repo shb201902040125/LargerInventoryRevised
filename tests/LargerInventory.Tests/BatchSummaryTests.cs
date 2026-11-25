@@ -17,6 +17,7 @@ internal static partial class Program
         Run(nameof(BatchSummary_CoalescesWritesAcrossStrongCommands));
         Run(nameof(BatchSummary_PublishesAtWeakBarriersAndPersistsFinalState));
         Run(nameof(PageEviction_StopsAtCapForFreshPages));
+        Run(nameof(StrongSlotValidation_RejectsDuplicateSmallAndLargeSets));
     }
 
     private static void BatchSummary_CoalescesWritesAcrossStrongCommands()
@@ -137,8 +138,8 @@ internal static partial class Program
             cache.MarkDirty(pages[1]);
 
             cache.TrimToLimit();
-            Expect(pages.Count(page => page.Loaded) == cap && pages[0].Loaded && pages[1].Loaded,
-                "trimming over cap must retain pinned and dirty pages plus one fresh clean page");
+            Expect(pages.Count(page => page.Loaded) == cap && pages[0].Loaded && pages[1].Loaded && pages[^1].Loaded,
+                "trimming over cap must preserve pinned and dirty pages and evict clean pages in directory order");
             cache.UnpinAll();
             Expect(pages.Count(page => page.Loaded) == cap && cache.AllocatedPages.Count == pages.Length,
                 "a second trim at cap must keep all fresh pages and retain the directory entries");
@@ -149,13 +150,32 @@ internal static partial class Program
         }
     }
 
+    private static void StrongSlotValidation_RejectsDuplicateSmallAndLargeSets()
+    {
+        using var store = new InventoryStore();
+        var page = store.AllocatePage();
+        foreach (int size in new[] { 2, 9 })
+        {
+            var slots = Enumerable.Range(0, size).Select(i => BatchSlot(page, i)).ToArray();
+            var valid = CommandFactory.Escape(slots, static _ => CommandResult.Ok());
+            PumpBatch(store, valid);
+            Expect(valid.Result.IsOk, $"{size} distinct slots should be accepted");
+
+            slots[^1] = slots[0];
+            var invalid = CommandFactory.Escape(slots, static _ => CommandResult.Ok());
+            PumpBatch(store, invalid);
+            Expect(invalid.Result.Status == CommandStatus.InvalidArg, $"duplicates in a {size}-slot set should be rejected");
+        }
+    }
+
     private static int RunWavesBenchmark()
     {
         const int commandsPerBatch = 64;
         const int warmupBatches = 32;
         const int measuredBatches = 256;
-        Console.WriteLine($"Warm strong moves, {measuredBatches} batches of {commandsPerBatch} commands per mode");
-        Console.WriteLine("Timings cover batch submission and Pump. P95/P99 are per-batch latencies.");
+        Console.WriteLine($"Warm strong commands, {measuredBatches} batches of {commandsPerBatch} commands per mode");
+        Console.WriteLine("Timings cover batch submission and Pump. All extension delegates are no-ops.");
+        foreach (var workload in new[] { "moves", "borrowed escape", "cloned escape" })
         foreach (var requestedWidth in new[] { 1, 4, 8 })
         {
             var config = new StoreConfig
@@ -178,7 +198,11 @@ internal static partial class Program
                 {
                     var from = BatchSlot(page, 2 * i + side);
                     var to = BatchSlot(page, 2 * i + (1 - side));
-                    batch[i] = CommandFactory.Move(from, to, timeoutMs: i == batch.Length - 1 ? 0 : BatchDeferred);
+                    var timeout = i == batch.Length - 1 ? 0 : BatchDeferred;
+                    batch[i] = workload == "moves"
+                        ? CommandFactory.Move(from, to, timeoutMs: timeout, callback: static _ => { })
+                        : CommandFactory.EscapeConcurrent([from], readOnly: true, static _ => CommandResult.Ok(),
+                            timeoutMs: timeout, callback: static _ => { }, cloneItems: workload == "cloned escape");
                 }
                 return batch;
             }
@@ -189,6 +213,7 @@ internal static partial class Program
             var batches = Enumerable.Range(warmupBatches, measuredBatches).Select(CreateBatch).ToArray();
             var samples = new double[measuredBatches];
             var completed = 0;
+            var allocatedBefore = GC.GetTotalAllocatedBytes(precise: true);
             var started = Stopwatch.GetTimestamp();
             for (var i = 0; i < batches.Length; i++)
             {
@@ -198,14 +223,15 @@ internal static partial class Program
                 samples[i] = Stopwatch.GetElapsedTime(batchStarted).TotalMilliseconds;
             }
             var elapsed = Stopwatch.GetElapsedTime(started);
+            var allocated = GC.GetTotalAllocatedBytes(precise: true) - allocatedBefore;
             Expect(completed == measuredBatches * commandsPerBatch &&
                 batches.All(batch => batch.All(command => command.Done.IsSet && command.Result.IsOk)),
                 $"width {requestedWidth}: every measured command must complete successfully");
             Array.Sort(samples);
             double Percentile(double fraction) => samples[(int)Math.Ceiling(samples.Length * fraction) - 1];
             var label = requestedWidth == 1 ? "serial" : $"wave {requestedWidth}";
-            Console.WriteLine($"{label} (configured width {config.MaxConcurrentCommandsPerBatch}): " +
-                $"elapsed {elapsed.TotalMilliseconds:F2} ms, P95 {Percentile(0.95):F3} ms, P99 {Percentile(0.99):F3} ms");
+            Console.WriteLine($"{workload}, {label}: elapsed {elapsed.TotalMilliseconds:F2} ms, " +
+                $"P95 {Percentile(0.95):F3} ms, P99 {Percentile(0.99):F3} ms, {allocated / completed:N0} B/command");
         }
         return 0;
     }

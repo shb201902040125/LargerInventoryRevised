@@ -16,16 +16,28 @@ public static partial class NetworkSystem
     private static void RefreshEscrowLocks(InventoryStore store, TransactionLedger ledger)
     {
         var slots = new HashSet<int>();
+        var lockedCounts = new Dictionary<int, long>();
         var entries = ledger.GetPrepared();
         var deadline = long.MaxValue;
         foreach (var (_, entry) in entries)
         {
             var record = EscrowRecord.Read(entry.Result);
             deadline = Math.Min(deadline, record.DeadlineUtcTicks);
-            foreach (var slot in record.OriginalSlots.Keys)
+            foreach (var (slot, original) in record.OriginalSlots)
+            {
                 slots.Add(slot);
+                if (!original.IsAir)
+                    lockedCounts[original.type] = lockedCounts.GetValueOrDefault(original.type) + original.stack;
+            }
+            if (!record.IsPut)
+            {
+                foreach (var item in record.Items)
+                    lockedCounts[item.type] = lockedCounts.GetValueOrDefault(item.type) - item.stack;
+            }
         }
-        store.SetEscrowSlots(slots);
+        foreach (var type in lockedCounts.Where(pair => pair.Value <= 0).Select(pair => pair.Key).ToArray())
+            lockedCounts.Remove(type);
+        store.SetEscrowSlots(slots, lockedCounts);
         if (entries.Count == 0) EscrowStores.Remove(store);
         else EscrowStores[store] = deadline;
     }

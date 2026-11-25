@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using LargerInventory.Backend.Commands;
+using LargerInventory.Backend.Crafting;
 using LargerInventory.Backend.Network;
 using LargerInventory.Backend.Storage;
 using Terraria.ID;
@@ -17,7 +18,7 @@ public sealed class InventoryDebugCommand : ModCommand
 {
     public override CommandType Type => CommandType.Chat;
     public override string Command => "li";
-    public override string Usage => "/li fill <type> <count> | take <type> <count> | q <type> | slot <slotId> | move <srcSlot> <dstSlot> | stats | repair [world|status|cancel] | pause [on|off] | netq <type> [world] | netfill <type> <count> | nettake <type> <count> [manual] | netmove <srcSlot> <dstSlot> | netresult <operation-id> | netcollect <operation-id> [operation-id ...]";
+    public override string Usage => "/li fill <type> <count> | take <type> <count> | q <type> | slot <slotId> | move <srcSlot> <dstSlot> | recipes [-world] | stats | repair [world|status|cancel] | pause [on|off] | netq <type> [world] | netfill <type> <count> | nettake <type> <count> [manual] | netmove <srcSlot> <dstSlot> | netresult <operation-id> | netcollect <operation-id> [operation-id ...]";
     public override string Description => "LargerInventory test command (requires config).";
 
     public override void Action(CommandCaller caller, string input, string[] args)
@@ -37,6 +38,28 @@ public sealed class InventoryDebugCommand : ModCommand
 
         var sub = args[0].ToLowerInvariant();
         Log.Info($"/li invoked: {string.Join(" ", args)}");
+        if (sub == "recipes")
+        {
+            bool world = args.Length == 2 && args[1].Equals("-world", StringComparison.OrdinalIgnoreCase);
+            if (args.Length != 1 && !world)
+            {
+                caller.Reply("Usage: /li recipes [-world]");
+                return;
+            }
+            CraftingQueries.QueryAvailableRecipes(result =>
+            {
+                if (result.ResultPayload is not CraftingAvailability availability)
+                {
+                    caller.Reply($"Recipe query failed: {result.Status}");
+                    return;
+                }
+                int available = 0;
+                for (int index = 0; index < availability.RecipeCount; index++)
+                    if (availability.IsAvailable(index)) available++;
+                caller.Reply($"{(world ? "World" : "Personal")} warehouse: {available}/{availability.RecipeCount} candidate recipes.");
+            }, world);
+            return;
+        }
         if (sub is "netq" or "netfill" or "nettake" or "netmove" or "netresult" or "netcollect")
         {
             HandleNetwork(args, sub, caller);

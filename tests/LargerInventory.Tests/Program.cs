@@ -19,6 +19,8 @@ internal static partial class Program
     {
         if (args.Contains("--benchmark-waves", StringComparer.Ordinal))
             return RunWavesBenchmark();
+        if (args.Contains("--benchmark-crafting", StringComparer.Ordinal))
+            return RunCraftingBenchmark();
 
         Run(nameof(PageDirectory_AllocatesAfterRestoredPages));
         Run(nameof(PageDirectory_ReusesGapsWithoutTouchingExistingPages));
@@ -47,6 +49,7 @@ internal static partial class Program
         Run(nameof(Executor_InvalidSlotQueryReturnsAirEntry));
 
         RunNetworkTests();
+        RunCraftingTests();
         RunStorageTests();
         RunCommandTests();
         RunQueueP0Tests();
